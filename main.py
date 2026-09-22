@@ -132,7 +132,7 @@ def extract_video_info(request: VideoRequest):
 
     ydl_opts = {
         # ইউটিউবের সব ধরনের নতুন ফরম্যাট (WebM/Opus) সাপোর্ট করার জন্য নমনীয় ফরম্যাট
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'bestvideo*+bestaudio/best',
         'no_warnings': True,
         'quiet': True,
         'extractor_args': {
