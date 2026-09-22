@@ -129,7 +129,6 @@ def extract_video_info(request: VideoRequest):
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'web'],
-                'skip': ['dash', 'hls']
             }
         },
         'http_headers': {
