@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 import imageio_ffmpeg
@@ -232,6 +233,183 @@ def download_file(
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# নতুন: ভিডিও/অডিও কনভার্টার (/api/convert)
+# yt-dlp দিয়ে সোর্স নামায় → ffmpeg দিয়ে পছন্দের ফরম্যাটে বদলায় → ফাইল পাঠায়।
+# কনভার্ট ভারী কাজ (CPU/RAM), তাই নিচে ৩টা সেফটি লিমিট আছে — দরকার হলে Render-এর Environment থেকে বদলানো যাবে:
+#   MAX_CONCURRENT_CONVERTS = একসাথে কয়টা কনভার্শন (ডিফল্ট ১)
+#   MAX_CONVERT_SECONDS     = সর্বোচ্চ ভিডিও দৈর্ঘ্য সেকেন্ডে (ডিফল্ট ৯০০ = ১৫ মিনিট)
+#   MAX_CONVERT_HEIGHT      = সর্বোচ্চ রেজোলিউশন (ডিফল্ট ১০৮০)
+# ---------------------------------------------------------------------------
+CONVERT_SLOTS = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_CONVERTS", "1")))
+MAX_CONVERT_SECONDS = int(os.environ.get("MAX_CONVERT_SECONDS", "900"))
+MAX_CONVERT_HEIGHT = int(os.environ.get("MAX_CONVERT_HEIGHT", "1080"))
+
+_H264_ARGS = [
+    "-map", "0:v:0", "-map", "0:a:0?",
+    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # বেজোড় সাইজ হলে libx264 ফেইল করে, তাই জোড় করে নেওয়া
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "160k",
+]
+
+# kind: video | gif | audio   (lossless=True হলে bitrate লাগে না)
+CONVERT_FORMATS = {
+    "mp4":  {"kind": "video", "media": "video/mp4",        "args": _H264_ARGS + ["-movflags", "+faststart"]},
+    "mov":  {"kind": "video", "media": "video/quicktime",  "args": _H264_ARGS + ["-movflags", "+faststart"]},
+    "mkv":  {"kind": "video", "media": "video/x-matroska", "args": _H264_ARGS},
+    "webm": {"kind": "video", "media": "video/webm", "args": [
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "33",
+        "-deadline", "realtime", "-cpu-used", "6", "-row-mt", "1",
+        "-c:a", "libopus", "-b:a", "128k",
+    ]},
+    "avi":  {"kind": "video", "media": "video/x-msvideo", "args": [
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-c:v", "mpeg4", "-q:v", "4",
+        "-c:a", "libmp3lame", "-b:a", "160k",
+    ]},
+    # GIF: সর্বোচ্চ ৩০ সেকেন্ড, ৪৮০px চওড়া, ১২ fps (নাহলে ফাইল অনেক বড় হয়ে যায়)
+    "gif":  {"kind": "gif", "media": "image/gif", "args": [
+        "-t", "30", "-an",
+        "-vf", "fps=12,scale='min(480,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer:bayer_scale=4",
+        "-loop", "0",
+    ]},
+    "mp3":  {"kind": "audio", "media": "audio/mpeg", "codec": ["-c:a", "libmp3lame"], "lossy": True},
+    "m4a":  {"kind": "audio", "media": "audio/mp4",  "codec": ["-c:a", "aac"],        "lossy": True},
+    "ogg":  {"kind": "audio", "media": "audio/ogg",  "codec": ["-c:a", "libvorbis"],  "lossy": True},
+    "wav":  {"kind": "audio", "media": "audio/wav",  "codec": ["-c:a", "pcm_s16le"],  "lossy": False},
+    "flac": {"kind": "audio", "media": "audio/flac", "codec": ["-c:a", "flac"],       "lossy": False},
+}
+
+
+def build_ffmpeg_args(fmt: str, bitrate: str):
+    spec = CONVERT_FORMATS[fmt]
+    if spec["kind"] != "audio":
+        return spec["args"]
+    args = ["-vn", "-map", "0:a:0"] + spec["codec"]
+    if spec["lossy"]:
+        args += ["-b:a", f"{parse_bitrate(bitrate)}k"]
+    return args
+
+
+def run_or_raise(cmd, timeout, fail_msg):
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()[-300:] or fail_msg
+        raise RuntimeError(detail)
+
+
+@app.get("/api/convert")
+def convert_media(
+    url: str,
+    fmt: str = "mp4",
+    quality: str = "1080p",
+    bitrate: str = "192kbps",
+):
+    fmt = (fmt or "").lower().strip()
+    if not is_valid_http_url(url):
+        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+    if fmt not in CONVERT_FORMATS:
+        raise HTTPException(status_code=400, detail="এই ফরম্যাটটি সাপোর্টেড নয়।")
+
+    # সার্ভার ব্যস্ত থাকলে লাইনে না রেখে সাথে সাথে জানিয়ে দেওয়া (নাহলে সার্ভার ক্র্যাশ করতে পারে)
+    if not CONVERT_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি কনভার্শন করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+
+    tmpdir = None
+    handed_off = False
+    try:
+        # ---- আগে দৈর্ঘ্য যাচাই: বেশি লম্বা ভিডিও শুরুতেই আটকানো ----
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info.get("is_live"):
+            raise HTTPException(status_code=400, detail="লাইভ ভিডিও কনভার্ট করা যাবে না।")
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_CONVERT_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"কনভার্টারে সর্বোচ্চ {MAX_CONVERT_SECONDS // 60} মিনিটের ভিডিও করা যায়। এই ভিডিওটি {int(duration) // 60} মিনিটের।",
+            )
+
+        tmpdir = tempfile.mkdtemp(prefix="buffradar_conv_")
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        kind = CONVERT_FORMATS[fmt]["kind"]
+
+        # ---- ধাপ ১: সোর্স নামানো ----
+        if kind == "audio":
+            fmt_selector = "bestaudio/best"
+        else:
+            h = MAX_CONVERT_HEIGHT if kind == "video" else 480
+            h = min(parse_height(quality), h) if kind == "video" else h
+            if kind == "gif":
+                fmt_selector = f"bestvideo[height<={h}]/best[height<={h}]/best"
+            else:
+                fmt_selector = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]/best"
+
+        run_or_raise(
+            [
+                "yt-dlp", "-f", fmt_selector,
+                "--merge-output-format", "mkv",
+                "--ffmpeg-location", ffmpeg_path,
+                "-o", os.path.join(tmpdir, "src.%(ext)s"),
+                "--no-playlist", "--no-warnings", "-q",
+                "--", url,
+            ],
+            timeout=1200,
+            fail_msg="সোর্স ফাইল নামানো যায়নি।",
+        )
+        sources = [
+            f for f in glob.glob(os.path.join(tmpdir, "src.*"))
+            if not f.endswith((".part", ".ytdl"))
+        ]
+        if not sources:
+            raise RuntimeError("সোর্স ফাইল নামানো যায়নি।")
+        src_path = max(sources, key=os.path.getsize)
+
+        # ---- ধাপ ২: ffmpeg দিয়ে কনভার্ট ----
+        out_path = os.path.join(tmpdir, f"out.{fmt}")
+        run_or_raise(
+            [ffmpeg_path, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src_path]
+            + build_ffmpeg_args(fmt, bitrate)
+            + [out_path],
+            timeout=1800,
+            fail_msg="কনভার্ট করা যায়নি।",
+        )
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("কনভার্ট করা ফাইল তৈরি হয়নি।")
+
+        try:
+            os.remove(src_path)  # জায়গা বাঁচাতে সোর্স ফাইল আগেই মুছে ফেলা
+        except OSError:
+            pass
+
+        handed_off = True
+        return FileResponse(
+            out_path,
+            media_type=CONVERT_FORMATS[fmt]["media"],
+            filename=f"Buffradar_convert.{fmt}",
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
+
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="কনভার্ট করতে বেশি সময় লাগছে। ছোট ভিডিও বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # ফাইল পাঠানো শুরু হয়ে গেলে ফোল্ডার BackgroundTask মুছবে; আর কোনো এরর হলে এখানেই মুছে যাবে
+        if tmpdir and not handed_off:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        CONVERT_SLOTS.release()
 
 
 # থাম্বনেইল আর জরুরি ফলব্যাকের জন্য পুরোনো স্ট্রিমিং এন্ডপয়েন্ট আগের মতোই আছে
