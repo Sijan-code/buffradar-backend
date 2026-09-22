@@ -122,13 +122,13 @@ def extract_video_info(request: VideoRequest):
 
     ydl_opts = {
         # ইউটিউবের সব ধরনের নতুন ফরম্যাট (WebM/Opus) সাপোর্ট করার জন্য নমনীয় ফরম্যাট
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'bestvideo*+bestaudio/best',
         'no_warnings': True,
         'quiet': True,
         # ইউটিউব যাতে রেন্ডার সার্ভারকে সহজে ব্লক না করতে পারে তার জন্য কিছু বাড়তি অপশন
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['web', 'android', 'ios'],
             }
         },
         'http_headers': {
