@@ -122,7 +122,7 @@ def extract_video_info(request: VideoRequest):
 
     ydl_opts = {
         # ইউটিউবের সব ধরনের নতুন ফরম্যাট (WebM/Opus) সাপোর্ট করার জন্য নমনীয় ফরম্যাট
-        'format': 'bestvideo*+bestaudio/best',
+        'format': 'bestvideo+bestaudio/best',
         'no_warnings': True,
         'quiet': True,
         'http_headers': {
@@ -188,7 +188,17 @@ def extract_video_info(request: VideoRequest):
     except HTTPException:
         raise
     except Exception as e:
+        # ডিবাগ: কী ফরম্যাট আসলে পাওয়া যাচ্ছে সেটা লগে দেখানোর জন্য
+        try:
+            debug_opts = {'quiet': True, 'no_warnings': True, **cookie_ydl_opts()}
+            with yt_dlp.YoutubeDL(debug_opts) as ydl2:
+                debug_info = ydl2.extract_info(video_url, download=False)
+            fmts = [(f.get('format_id'), f.get('ext'), f.get('height'), f.get('acodec'), f.get('vcodec')) for f in (debug_info.get('formats') or [])]
+            print("AVAILABLE FORMATS ON RENDER:", fmts)
+        except Exception as e2:
+            print("DEBUG EXTRACT ALSO FAILED:", str(e2))
         raise HTTPException(status_code=500, detail=f"লিঙ্কটি প্রসেস করা যায়নি: {str(e)}")
+
 
 
 # ---------------------------------------------------------------------------
