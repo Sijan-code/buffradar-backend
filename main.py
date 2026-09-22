@@ -130,6 +130,9 @@ def extract_video_info(request: VideoRequest):
         **cookie_ydl_opts(),
     }
 
+    print("YT-DLP VERSION:",
+    yt_dlp.version.__version__)
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
