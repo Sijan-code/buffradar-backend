@@ -33,6 +33,26 @@ class VideoRequest(BaseModel):
     url: str
 
 
+# ---------------------------------------------------------------------------
+# YouTube cookies সাপোর্ট (Render/cloud সার্ভার থেকে গেলে YouTube বট-চেক করে
+# ব্লক করে দেয়: "Sign in to confirm you're not a bot" এরর আসে)।
+# Render dashboard -> Environment -> Secret Files এ "cookies.txt" নামে একটা
+# ফাইল আপলোড করলে এটা /etc/secrets/cookies.txt পাথে পাওয়া যাবে।
+# লোকাল/ডেভ মেশিনে ফাইলটা না থাকলে চুপচাপ স্কিপ হয়ে যাবে, এরর দেবে না।
+# ---------------------------------------------------------------------------
+COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
+
+
+def cookie_ydl_opts():
+    """yt_dlp.YoutubeDL(...) এ পাস করার জন্য cookies অপশন (dict)।"""
+    return {"cookiefile": COOKIES_PATH} if os.path.exists(COOKIES_PATH) else {}
+
+
+def cookie_cli_args():
+    """subprocess দিয়ে চালানো yt-dlp কমান্ডের জন্য cookies আর্গুমেন্ট (list)।"""
+    return ["--cookies", COOKIES_PATH] if os.path.exists(COOKIES_PATH) else []
+
+
 def fetch_youtube_api_tags(video_id):
     api_key = os.environ.get("YOUTUBE_API_KEY")
     if not api_key or not video_id:
@@ -96,7 +116,8 @@ def extract_video_info(request: VideoRequest):
         'quiet': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        }
+        },
+        **cookie_ydl_opts(),
     }
 
     try:
@@ -177,6 +198,7 @@ def download_file(
             abr = parse_bitrate(bitrate)
             cmd = [
                 "yt-dlp",
+                *cookie_cli_args(),
                 "-f", "bestaudio/best",
                 "-x", "--audio-format", "mp3", "--audio-quality", f"{abr}K",
                 "--ffmpeg-location", ffmpeg_path,
@@ -190,6 +212,7 @@ def download_file(
             fmt = f"bestvideo[height<={height_limit}]+bestaudio/best[height<={height_limit}]/best"
             cmd = [
                 "yt-dlp",
+                *cookie_cli_args(),
                 "-f", fmt,
                 "--merge-output-format", "mp4",
                 "--ffmpeg-location", ffmpeg_path,
@@ -328,7 +351,7 @@ def convert_media(
     handed_off = False
     try:
         # ---- আগে দৈর্ঘ্য যাচাই: বেশি লম্বা ভিডিও শুরুতেই আটকানো ----
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, **cookie_ydl_opts()}) as ydl:
             info = ydl.extract_info(url, download=False)
         if info.get("is_live"):
             raise HTTPException(status_code=400, detail="লাইভ ভিডিও কনভার্ট করা যাবে না।")
@@ -356,7 +379,9 @@ def convert_media(
 
         run_or_raise(
             [
-                "yt-dlp", "-f", fmt_selector,
+                "yt-dlp",
+                *cookie_cli_args(),
+                "-f", fmt_selector,
                 "--merge-output-format", "mkv",
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", os.path.join(tmpdir, "src.%(ext)s"),
@@ -432,6 +457,7 @@ async def proxy_download(
 
             ytdlp_cmd = [
                 "yt-dlp",
+                *cookie_cli_args(),
                 "-f", "bestaudio/best",
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", "-",
@@ -460,6 +486,7 @@ async def proxy_download(
 
             cmd = [
                 "yt-dlp",
+                *cookie_cli_args(),
                 "-f", format_selector,
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", "-",
