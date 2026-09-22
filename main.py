@@ -121,7 +121,7 @@ def extract_video_info(request: VideoRequest):
         raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
 
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo+bestaudio/best',
         'no_warnings': True,
         'quiet': True,
         'http_headers': {
