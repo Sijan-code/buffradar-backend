@@ -137,11 +137,15 @@ def extract_video_info(request: VideoRequest):
         'quiet': True,
         'extractor_args': {
              'youtube': {
-                'player_client': ['tv'],
-             }
+                # 'tv' বদলে 'ios' এবং 'web' ব্যবহার করা হয়েছে যা PO Token জেনারেট করতে পারে
+                'player_client': ['ios', 'web'],
+                # কোনো টাকা ছাড়া স্বয়ংক্রিয়ভাবে একটি ভেরিফাইড PO Token তৈরি করার ফ্রি কমান্ড
+                'po_token': ['web+generated'],
+             },
         },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            # আইওএস এবং ওয়েব ক্লায়েন্টের সাথে ম্যাচিং আধুনিক ইউজার এজেন্ট
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         },
