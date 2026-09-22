@@ -52,6 +52,16 @@ os.path.exists(COOKIES_PATH)
 else 0
 )
 
+# /etc/secrets read-only, তাই cookies ফাইলটা writable temp ফোল্ডারে কপি করে রাখা হচ্ছে
+WRITABLE_COOKIES_PATH = "/tmp/cookies.txt"
+if os.path.exists(COOKIES_PATH):
+    try:
+        shutil.copyfile(COOKIES_PATH, WRITABLE_COOKIES_PATH)
+        COOKIES_PATH = WRITABLE_COOKIES_PATH
+    except Exception as e:
+        print("COOKIE COPY FAILED:", str(e))
+
+
 
 def cookie_ydl_opts():
     """yt_dlp.YoutubeDL(...) এ পাস করার জন্য cookies অপশন (dict)।"""
