@@ -41,6 +41,16 @@ class VideoRequest(BaseModel):
 # লোকাল/ডেভ মেশিনে ফাইলটা না থাকলে চুপচাপ স্কিপ হয়ে যাবে, এরর দেবে না।
 # ---------------------------------------------------------------------------
 COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
+print(
+    "YT COOKIES:",
+
+os.path.exists(COOKIES_PATH),
+    COOKIES_PATH,
+
+os.path.getsize(COOKIES_PATH) if
+os.path.exists(COOKIES_PATH)
+else 0
+)
 
 
 def cookie_ydl_opts():
