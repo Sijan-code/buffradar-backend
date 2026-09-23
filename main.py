@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
@@ -407,6 +407,91 @@ def convert_media(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # ফাইল পাঠানো শুরু হয়ে গেলে ফোল্ডার BackgroundTask মুছবে; আর কোনো এরর হলে এখানেই মুছে যাবে
+        if tmpdir and not handed_off:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        CONVERT_SLOTS.release()
+
+
+# ---------------------------------------------------------------------------
+# নতুন: সরাসরি ফাইল আপলোড করে কনভার্ট (/api/convert-upload)
+# ইউজার নিজের কম্পিউটার/ফোন থেকে ফাইল আপলোড করলে এখানে আসে — কোনো yt-dlp ডাউনলোড ধাপ লাগে না,
+# সরাসরি ffmpeg দিয়ে কনভার্ট করে পাঠিয়ে দেয়।
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))  # ডিফল্ট ৫০০MB
+
+
+@app.post("/api/convert-upload")
+async def convert_uploaded_file(
+    file: UploadFile = File(...),
+    fmt: str = Form("mp4"),
+    quality: str = Form("1080p"),
+    bitrate: str = Form("192kbps"),
+):
+    fmt = (fmt or "").lower().strip()
+    if fmt not in CONVERT_FORMATS:
+        raise HTTPException(status_code=400, detail="এই ফরম্যাটটি সাপোর্টেড নয়।")
+
+    # সার্ভার ব্যস্ত থাকলে লাইনে না রেখে সাথে সাথে জানিয়ে দেওয়া
+    if not CONVERT_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি কনভার্শন করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+
+    tmpdir = None
+    handed_off = False
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="buffradar_upload_")
+
+        # ---- ধাপ ১: আপলোড করা ফাইল ডিস্কে সেভ করা (সাইজ লিমিট চেক করতে করতে) ----
+        orig_ext = os.path.splitext(file.filename or "")[1] or ".bin"
+        src_path = os.path.join(tmpdir, f"src{orig_ext}")
+        written = 0
+        with open(src_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"ফাইলটি অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)}MB পর্যন্ত সাপোর্টেড।",
+                    )
+                out.write(chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="খালি ফাইল আপলোড করা যাবে না।")
+
+        # ---- ধাপ ২: ffmpeg দিয়ে কনভার্ট ----
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        out_path = os.path.join(tmpdir, f"out.{fmt}")
+        run_or_raise(
+            [ffmpeg_path, "-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src_path]
+            + build_ffmpeg_args(fmt, bitrate)
+            + [out_path],
+            timeout=1800,
+            fail_msg="কনভার্ট করা যায়নি।",
+        )
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("কনভার্ট করা ফাইল তৈরি হয়নি।")
+
+        try:
+            os.remove(src_path)  # জায়গা বাঁচাতে সোর্স ফাইল আগেই মুছে ফেলা
+        except OSError:
+            pass
+
+        handed_off = True
+        return FileResponse(
+            out_path,
+            media_type=CONVERT_FORMATS[fmt]["media"],
+            filename=f"Buffradar_convert.{fmt}",
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
+
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="কনভার্ট করতে বেশি সময় লাগছে। ছোট ফাইল বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
         if tmpdir and not handed_off:
             shutil.rmtree(tmpdir, ignore_errors=True)
         CONVERT_SLOTS.release()
