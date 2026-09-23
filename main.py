@@ -33,46 +33,6 @@ class VideoRequest(BaseModel):
     url: str
 
 
-# ---------------------------------------------------------------------------
-# YouTube cookies সাপোর্ট (Render/cloud সার্ভার থেকে গেলে YouTube বট-চেক করে
-# ব্লক করে দেয়: "Sign in to confirm you're not a bot" এরর আসে)।
-# Render dashboard -> Environment -> Secret Files এ "cookies.txt" নামে একটা
-# ফাইল আপলোড করলে এটা /etc/secrets/cookies.txt পাথে পাওয়া যাবে।
-# লোকাল/ডেভ মেশিনে ফাইলটা না থাকলে চুপচাপ স্কিপ হয়ে যাবে, এরর দেবে না।
-# ---------------------------------------------------------------------------
-COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
-print(
-    "YT COOKIES:",
-
-os.path.exists(COOKIES_PATH),
-    COOKIES_PATH,
-
-os.path.getsize(COOKIES_PATH) if
-os.path.exists(COOKIES_PATH)
-else 0
-)
-
-# /etc/secrets read-only, তাই cookies ফাইলটা writable temp ফোল্ডারে কপি করে রাখা হচ্ছে
-WRITABLE_COOKIES_PATH = "/tmp/cookies.txt"
-if os.path.exists(COOKIES_PATH):
-    try:
-        shutil.copyfile(COOKIES_PATH, WRITABLE_COOKIES_PATH)
-        COOKIES_PATH = WRITABLE_COOKIES_PATH
-    except Exception as e:
-        print("COOKIE COPY FAILED:", str(e))
-
-
-
-def cookie_ydl_opts():
-    """yt_dlp.YoutubeDL(...) এ পাস করার জন্য cookies অপশন (dict)।"""
-    return {"cookiefile": COOKIES_PATH} if os.path.exists(COOKIES_PATH) else {}
-
-
-def cookie_cli_args():
-    """subprocess দিয়ে চালানো yt-dlp কমান্ডের জন্য cookies আর্গুমেন্ট (list)।"""
-    return ["--cookies", COOKIES_PATH] if os.path.exists(COOKIES_PATH) else []
-
-
 def fetch_youtube_api_tags(video_id):
     api_key = os.environ.get("YOUTUBE_API_KEY")
     if not api_key or not video_id:
@@ -131,29 +91,13 @@ def extract_video_info(request: VideoRequest):
         raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
 
     ydl_opts = {
-        # ইউটিউবের সব ধরনের নতুন ফরম্যাট (WebM/Opus) সাপোর্ট করার জন্য নমনীয় ফরম্যাট
-        'format': 'bestvideo*+bestaudio/best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'no_warnings': True,
         'quiet': True,
-        'extractor_args': {
-             'youtube': {
-                # 'tv' বদলে 'ios' এবং 'web' ব্যবহার করা হয়েছে যা PO Token জেনারেট করতে পারে
-                'player_client': ['ios', 'web'],
-                # কোনো টাকা ছাড়া স্বয়ংক্রিয়ভাবে একটি ভেরিফাইড PO Token তৈরি করার ফ্রি কমান্ড
-                'po_token': ['web+generated'],
-             },
-        },
         'http_headers': {
-            # আইওএস এবং ওয়েব ক্লায়েন্টের সাথে ম্যাচিং আধুনিক ইউজার এজেন্ট
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-        },
-        **cookie_ydl_opts(),
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        }
     }
-
-    print("YT-DLP VERSION:",
-    yt_dlp.version.__version__)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -207,17 +151,7 @@ def extract_video_info(request: VideoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        # ডিবাগ: কী ফরম্যাট আসলে পাওয়া যাচ্ছে সেটা লগে দেখানোর জন্য
-        try:
-            debug_opts = {'quiet': True, 'no_warnings': True, **cookie_ydl_opts()}
-            with yt_dlp.YoutubeDL(debug_opts) as ydl2:
-                debug_info = ydl2.extract_info(video_url, download=False)
-            fmts = [(f.get('format_id'), f.get('ext'), f.get('height'), f.get('acodec'), f.get('vcodec')) for f in (debug_info.get('formats') or [])]
-            print("AVAILABLE FORMATS ON RENDER:", fmts)
-        except Exception as e2:
-            print("DEBUG EXTRACT ALSO FAILED:", str(e2))
         raise HTTPException(status_code=500, detail=f"লিঙ্কটি প্রসেস করা যায়নি: {str(e)}")
-
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +177,6 @@ def download_file(
             abr = parse_bitrate(bitrate)
             cmd = [
                 "yt-dlp",
-                *cookie_cli_args(),
                 "-f", "bestaudio/best",
                 "-x", "--audio-format", "mp3", "--audio-quality", f"{abr}K",
                 "--ffmpeg-location", ffmpeg_path,
@@ -257,7 +190,6 @@ def download_file(
             fmt = f"bestvideo[height<={height_limit}]+bestaudio/best[height<={height_limit}]/best"
             cmd = [
                 "yt-dlp",
-                *cookie_cli_args(),
                 "-f", fmt,
                 "--merge-output-format", "mp4",
                 "--ffmpeg-location", ffmpeg_path,
@@ -396,7 +328,7 @@ def convert_media(
     handed_off = False
     try:
         # ---- আগে দৈর্ঘ্য যাচাই: বেশি লম্বা ভিডিও শুরুতেই আটকানো ----
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, **cookie_ydl_opts()}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
             info = ydl.extract_info(url, download=False)
         if info.get("is_live"):
             raise HTTPException(status_code=400, detail="লাইভ ভিডিও কনভার্ট করা যাবে না।")
@@ -424,9 +356,7 @@ def convert_media(
 
         run_or_raise(
             [
-                "yt-dlp",
-                *cookie_cli_args(),
-                "-f", fmt_selector,
+                "yt-dlp", "-f", fmt_selector,
                 "--merge-output-format", "mkv",
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", os.path.join(tmpdir, "src.%(ext)s"),
@@ -502,7 +432,6 @@ async def proxy_download(
 
             ytdlp_cmd = [
                 "yt-dlp",
-                *cookie_cli_args(),
                 "-f", "bestaudio/best",
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", "-",
@@ -531,7 +460,6 @@ async def proxy_download(
 
             cmd = [
                 "yt-dlp",
-                *cookie_cli_args(),
                 "-f", format_selector,
                 "--ffmpeg-location", ffmpeg_path,
                 "-o", "-",
