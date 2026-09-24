@@ -7,6 +7,7 @@ import glob
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -495,6 +496,187 @@ async def convert_uploaded_file(
         if tmpdir and not handed_off:
             shutil.rmtree(tmpdir, ignore_errors=True)
         CONVERT_SLOTS.release()
+
+
+# ---------------------------------------------------------------------------
+# নতুন: Editor ট্যাব (/api/edit) — একই সোর্স-ডাউনলোড প্যাটার্ন, শুধু ffmpeg ফিল্টার আলাদা।
+#   mode=trim     -> নির্দিষ্ট অংশ কেটে + crop/aspect বদলে (9:16 / 1:1 / 16:9)
+#   mode=remove   -> নির্দিষ্ট জায়গার ওয়াটারমার্ক/লোগো/হার্ডকোডেড সাবটাইটেল ঝাপসা করে মুছে দেয় (ffmpeg delogo,
+#                    সত্যিকারের object-detection AI না — নির্দিষ্ট বক্স এলাকায় ইন্টারপোলেশন করে ঢেকে দেয়)
+#   mode=compress -> HD মান রেখে ফাইল সাইজ ছোট করে (light/medium/high)
+# ---------------------------------------------------------------------------
+EDIT_SLOTS = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT_EDITS", "1")))
+MAX_EDIT_SECONDS = int(os.environ.get("MAX_EDIT_SECONDS", "900"))
+
+# 🪄 Object remover-এর পজিশন প্রিসেট: (x_fraction, y_fraction, w_fraction, h_fraction) — ভিডিওর প্রস্থ/উচ্চতার শতাংশ হিসেবে
+REMOVE_POSITION_PRESETS = {
+    "top-left":     (0.02, 0.02, 0.24, 0.13),
+    "top-right":    (0.74, 0.02, 0.24, 0.13),
+    "top-band":     (0.05, 0.02, 0.90, 0.15),
+    "bottom-left":  (0.02, 0.85, 0.24, 0.13),
+    "bottom-right": (0.74, 0.85, 0.24, 0.13),
+    "bottom-band":  (0.05, 0.82, 0.90, 0.16),
+}
+
+# 📉 কমপ্রেশন লেভেল অনুযায়ী CRF আর সর্বোচ্চ উচ্চতা
+COMPRESS_LEVELS = {
+    "light":  {"crf": 24, "max_height": 1080},
+    "medium": {"crf": 28, "max_height": 1080},
+    "high":   {"crf": 32, "max_height": 720},
+}
+
+
+def get_video_dimensions(ffmpeg_path: str, path: str):
+    """ffprobe নেই, তাই ffmpeg -i চালিয়ে stderr থেকে রেজোলিউশন বের করা হয়।"""
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-i", path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    m = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", result.stderr or "")
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 1280, 720  # খুঁজে না পেলে নিরাপদ ডিফল্ট
+
+
+def build_crop_filter(preset: str) -> str:
+    if preset == "9:16":
+        return "crop='if(gt(iw/ih,9/16),trunc(ih*9/16/2)*2,iw)':'if(gt(iw/ih,9/16),ih,trunc(iw*16/9/2)*2)'"
+    if preset == "1:1":
+        return "crop='trunc(min(iw,ih)/2)*2':'trunc(min(iw,ih)/2)*2'"
+    if preset == "16:9":
+        return "crop='if(gt(iw/ih,16/9),trunc(ih*16/9/2)*2,iw)':'if(gt(iw/ih,16/9),ih,trunc(iw*9/16/2)*2)'"
+    return ""  # original — কোনো ক্রপ না
+
+
+@app.get("/api/edit")
+def edit_media(
+    url: str,
+    mode: str,
+    start: float = 0,
+    end: float = 0,
+    crop: str = "original",
+    position: str = "bottom-band",
+    level: str = "medium",
+):
+    mode = (mode or "").lower().strip()
+    if not is_valid_http_url(url):
+        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+    if mode not in ("trim", "remove", "compress"):
+        raise HTTPException(status_code=400, detail="এই এডিট টুলটি সাপোর্টেড নয়।")
+    if mode == "remove" and position not in REMOVE_POSITION_PRESETS:
+        raise HTTPException(status_code=400, detail="ভুল পজিশন দেওয়া হয়েছে।")
+    if mode == "compress" and level not in COMPRESS_LEVELS:
+        raise HTTPException(status_code=400, detail="ভুল কমপ্রেশন লেভেল দেওয়া হয়েছে।")
+
+    if not EDIT_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি এডিট প্রসেস করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+
+    tmpdir = None
+    handed_off = False
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info.get("is_live"):
+            raise HTTPException(status_code=400, detail="লাইভ ভিডিও এডিট করা যাবে না।")
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_EDIT_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"এডিটরে সর্বোচ্চ {MAX_EDIT_SECONDS // 60} মিনিটের ভিডিও করা যায়। এই ভিডিওটি {int(duration) // 60} মিনিটের।",
+            )
+
+        tmpdir = tempfile.mkdtemp(prefix="buffradar_edit_")
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
+        # ---- ধাপ ১: সোর্স নামানো ----
+        max_h = COMPRESS_LEVELS[level]["max_height"] if mode == "compress" else MAX_CONVERT_HEIGHT
+        fmt_selector = f"bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best"
+        run_or_raise(
+            [
+                "yt-dlp", "-f", fmt_selector,
+                "--merge-output-format", "mkv",
+                "--ffmpeg-location", ffmpeg_path,
+                "-o", os.path.join(tmpdir, "src.%(ext)s"),
+                "--no-playlist", "--no-warnings", "-q",
+                "--", url,
+            ],
+            timeout=1200,
+            fail_msg="সোর্স ফাইল নামানো যায়নি।",
+        )
+        sources = [
+            f for f in glob.glob(os.path.join(tmpdir, "src.*"))
+            if not f.endswith((".part", ".ytdl"))
+        ]
+        if not sources:
+            raise RuntimeError("সোর্স ফাইল নামানো যায়নি।")
+        src_path = max(sources, key=os.path.getsize)
+
+        # ---- ধাপ ২: মোড অনুযায়ী ffmpeg কমান্ড বানানো ----
+        out_path = os.path.join(tmpdir, "out.mp4")
+        pre_args, vf_parts = [], []
+
+        if mode == "trim":
+            s = max(0.0, float(start or 0))
+            e = float(end or 0)
+            dur = e - s
+            if dur <= 0:
+                raise HTTPException(status_code=400, detail="End time অবশ্যই Start time-এর চেয়ে বেশি হতে হবে।")
+            pre_args = ["-ss", str(s), "-t", str(dur)]
+            crop_vf = build_crop_filter(crop)
+            if crop_vf:
+                vf_parts.append(crop_vf)
+
+        elif mode == "remove":
+            frac = REMOVE_POSITION_PRESETS[position]
+            w, h = get_video_dimensions(ffmpeg_path, src_path)
+            fx, fy, fw, fh = frac
+            px, py = int(w * fx), int(h * fy)
+            pw, ph = max(2, int(w * fw)), max(2, int(h * fh))
+            vf_parts.append(f"delogo=x={px}:y={py}:w={pw}:h={ph}:show=0")
+
+        elif mode == "compress":
+            cfg = COMPRESS_LEVELS[level]
+            vf_parts.append(f"scale='min({cfg['max_height']}*iw/ih,iw)':'min({cfg['max_height']},ih)':force_original_aspect_ratio=decrease")
+
+        vf_parts.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")  # বেজোড় সাইজ হলে libx264 ফেইল করে
+        vf_chain = ",".join(vf_parts)
+
+        crf = str(COMPRESS_LEVELS[level]["crf"]) if mode == "compress" else "22"
+        cmd = (
+            [ffmpeg_path, "-y", "-nostdin", "-hide_banner", "-loglevel", "error"]
+            + pre_args
+            + ["-i", src_path, "-vf", vf_chain]
+            + ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p"]
+            + ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path]
+        )
+        run_or_raise(cmd, timeout=1800, fail_msg="এডিট করা যায়নি।")
+
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("এডিট করা ফাইল তৈরি হয়নি।")
+
+        try:
+            os.remove(src_path)
+        except OSError:
+            pass
+
+        handed_off = True
+        return FileResponse(
+            out_path,
+            media_type="video/mp4",
+            filename="Buffradar_edited.mp4",
+            background=BackgroundTask(shutil.rmtree, tmpdir, ignore_errors=True),
+        )
+
+    except HTTPException:
+        raise
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="এডিট করতে বেশি সময় লাগছে। ছোট অংশ বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmpdir and not handed_off:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        EDIT_SLOTS.release()
 
 
 # থাম্বনেইল আর জরুরি ফলব্যাকের জন্য পুরোনো স্ট্রিমিং এন্ডপয়েন্ট আগের মতোই আছে
