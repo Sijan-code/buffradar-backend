@@ -132,6 +132,12 @@ def is_valid_http_url(u: str) -> bool:
     return p.scheme in ("http", "https") and bool(p.netloc)
 
 
+@app.api_route("/", methods=["GET", "HEAD"])
+def health_root():
+    """Render-এর স্বাস্থ্য-পরীক্ষা (HEAD /) আর ঘুম ভাঙানোর জন্য ছোট উত্তর।"""
+    return {"status": "ok"}
+
+
 @app.post("/api/extract")
 def extract_video_info(request: VideoRequest):
     video_url = request.url
@@ -737,6 +743,14 @@ def edit_media(
 # ---------------------------------------------------------------------------
 EDIT_RESOLUTIONS = {"original": None, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
 EDIT_TEXT_COLORS = {"white", "black", "yellow", "red"}
+# ফ্রি সার্ভারে ধীর বা মেমোরি কম হলে Render-এর Environment-এ বদলান (কোড বদলাতে হবে না):
+# ডিফল্ট এখন ফ্রি সার্ভারের জন্য (ultrafast + ১ থ্রেড: দ্রুত ও মেমোরি কম)। ভালো সার্ভারে বদলান:
+#   EDIT_X264_PRESET = veryfast (ছোট ফাইল)    EDIT_FFMPEG_THREADS = 4
+EDIT_X264_PRESET = os.environ.get("EDIT_X264_PRESET", "ultrafast").strip() or "ultrafast"
+if EDIT_X264_PRESET not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium"}:
+    EDIT_X264_PRESET = "veryfast"
+_threads = (os.environ.get("EDIT_FFMPEG_THREADS", "1") or "1").strip()
+EDIT_THREAD_ARGS = ["-threads", _threads] if _threads.isdigit() and int(_threads) > 0 else []
 MAX_MUSIC_BYTES = 40 * 1024 * 1024
 MAX_STICKER_BYTES = 6 * 1024 * 1024
 MAX_STICKERS = 8
@@ -1123,7 +1137,7 @@ async def edit_uploaded_file(
         inputs = ["-i", src_path]
         n_in = 1
         graph = []
-        pre_args = []
+        pre_args = list(EDIT_THREAD_ARGS)  # ডিকোডারের থ্রেড/মেমোরি সীমা
 
         if len(kept) == 1:
             x0, y0 = kept[0]
@@ -1303,7 +1317,7 @@ async def edit_uploaded_file(
             raise HTTPException(status_code=400, detail="MP3 বানাতে অডিও দরকার, কিন্তু এই ভিডিওতে (বা মিউট করা থাকায়) কোনো অডিও নেই।")
 
         if output_format == "mp4":
-            codec_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"]
+            codec_args = ["-c:v", "libx264", "-preset", EDIT_X264_PRESET, "-crf", "22", "-pix_fmt", "yuv420p"] + EDIT_THREAD_ARGS
             codec_args += ["-c:a", "aac", "-b:a", "128k"] if audio_map else ["-an"]
             codec_args += ["-movflags", "+faststart", "-shortest"]
         elif output_format == "gif":
@@ -1315,6 +1329,7 @@ async def edit_uploaded_file(
 
         cmd = (
             [ffmpeg_path, "-y", "-nostdin", "-hide_banner", "-loglevel", "error"]
+            + (["-filter_complex_threads", "1"] if EDIT_THREAD_ARGS else [])
             + pre_args
             + inputs
             + (["-filter_complex", ";".join(graph)] if graph else [])
@@ -1401,8 +1416,8 @@ Keys you may include (omit a key if the user did not ask for it):
 - output_format: "gif" (animated GIF, max 30 seconds, no sound) or "mp3" (audio only). Omit for a normal video.
 
 Also always include:
-- summary: one short sentence saying what you will do, in the same language as the user's request.
-- unsupported: one short sentence (same language) naming anything requested that this editor cannot do here (for example adding music or stickers, subtitles, removing background, joining several clips), or an empty string.
+- summary: one short sentence saying what you will do, written in the language named at the end of the user message.
+- unsupported: one short sentence (same language as summary) naming anything requested that this editor cannot do here (for example adding music or stickers, subtitles, removing background, joining several clips), or an empty string.
 
 Never add edits the user did not ask for. If the request is unclear or is not about editing the video, include no settings and explain briefly in unsupported."""
 
@@ -1594,7 +1609,8 @@ def ai_edit_plan(body: AIPlanRequest, request: Request):
     duration = max(0.0, float(body.duration or 0))
     user_msg = (
         f"Clip length: {duration:.1f} seconds. Resolution: {int(body.width or 0)}x{int(body.height or 0)}.\n"
-        f"User request: {prompt}"
+        f"User request: {prompt}\n"
+        f"Write summary and unsupported in {'Bengali' if re.search(r'[\u0980-\u09FF]', prompt) else 'English'}."
     )
     model = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
     try:
