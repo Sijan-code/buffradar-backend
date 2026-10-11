@@ -168,7 +168,12 @@ def _sha(text: str, n: int = 20) -> str:
 
 
 def _sb_headers():
-    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"}
+    # নতুন ধরনের secret key (sb_secret_...) JWT নয়, তাই শুধু apikey হেডারে পাঠাতে হয়;
+    # Authorization: Bearer-এ দিলে Supabase "Invalid JWT" বলে প্রত্যাখ্যান করে। পুরোনো service_role key (JWT) দুই হেডারেই চলে।
+    h = {"apikey": SUPABASE_SERVICE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_SERVICE_KEY.startswith("eyJ"):
+        h["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+    return h
 
 
 def _sb_rpc(name: str, payload: dict):
@@ -334,7 +339,9 @@ def limited(kind: str, ref_from=None, ticket_param: str = ""):
 def usage_status(http_request: Request):
     """ফ্রন্টএন্ডে 'আজ কতটা ব্যবহার হয়েছে' দেখানোর জন্য।"""
     if not USAGE_ENABLED:
-        return {"enabled": False}
+        missing = [n for n, v in (("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_KEY)) if not v]
+        reason = "USAGE_LIMITS=off" if not missing else "missing_env"
+        return {"enabled": False, "reason": reason, "missing": missing}
     try:
         subject, tier, _ = resolve_identity(http_request)
         peek = _sb_rpc("peek_usage", {"p_subject": subject, "p_hours": USAGE_HOURS}) or {}
@@ -343,7 +350,8 @@ def usage_status(http_request: Request):
                 "usage": {k: (peek.get(k) or {}).get("used", 0) for k in GUEST_LIMITS}}
     except Exception as e:
         print(f"[usage] status ব্যর্থ: {e}")
-        return {"enabled": False}
+        m = re.search(r"HTTP (\d{3})", str(e))
+        return {"enabled": False, "reason": "supabase_error", "http_status": int(m.group(1)) if m else None}
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
