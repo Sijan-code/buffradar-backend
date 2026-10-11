@@ -1,14 +1,19 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from typing import List, Optional
+import functools
 import glob
+import hashlib
+import inspect
 import json
 import mimetypes
 import os
 import re
+import secrets
 import time
 import requests
 import shutil
@@ -132,6 +137,215 @@ def is_valid_http_url(u: str) -> bool:
     return p.scheme in ("http", "https") and bool(p.netloc)
 
 
+# ---------------------------------------------------------------------------
+# ব্যবহারের সীমা (প্রথম ব্যবহার থেকে rolling ২৪ ঘণ্টা) — Supabase-এর usage_events টেবিল (usage_setup.sql) দিয়ে
+# Render-এ লাগবে: SUPABASE_URL আর SUPABASE_SERVICE_ROLE_KEY (গোপন চাবি! শুধু Render-এ, কখনো GitHub/ছবিতে নয়)
+# দুটোর একটা না থাকলে সীমা বন্ধ থাকে (লোকাল টেস্টে সুবিধা)। জরুরিতে বন্ধ করতে USAGE_LIMITS=off।
+# অতিথি = বেনামি (anonymous) Supabase অ্যাকাউন্ট; সদস্য = Google ইত্যাদি দিয়ে সাইন-আপ করা অ্যাকাউন্ট (সীমা ×৩)।
+# Supabase বা নেটে সমস্যা হলে সাইট বন্ধ না করে সীমা ছাড়াই কাজ চলতে দেওয়া হয় (fail-open)।
+# ---------------------------------------------------------------------------
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+SUPABASE_SERVICE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+USAGE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY) and os.environ.get("USAGE_LIMITS", "on").lower() != "off"
+GUEST_LIMITS = {"download": 4, "convert": 1, "edit_manual": 1, "edit_ai": 1}
+MEMBER_MULT = _env_int("USAGE_MEMBER_MULT", 3)   # সাইন-আপ করলে সীমা এত গুণ
+IP_MULT = _env_int("USAGE_IP_MULT", 5)           # নতুন বেনামি অ্যাকাউন্ট বানিয়ে সীমা এড়ানো ঠেকাতে IP-ভিত্তিক দ্বিতীয় বাধা
+USAGE_HOURS = 24
+_TOKEN_CACHE = {}                                # sha256(token) -> (মেয়াদ, user_id, tier)
+
+print("[usage] সীমা চালু আছে" if USAGE_ENABLED else "[usage] সীমা বন্ধ (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY সেট নেই)")
+
+
+def _sha(text: str, n: int = 20) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:n]
+
+
+def _sb_headers():
+    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"}
+
+
+def _sb_rpc(name: str, payload: dict):
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/rpc/{name}", headers=_sb_headers(), json=payload, timeout=8)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Supabase rpc {name} HTTP {r.status_code}: {r.text[:200]}")
+    return r.json() if r.text else None
+
+
+def client_ip(http_request: Request) -> str:
+    fwd = http_request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return http_request.client.host if http_request.client else "unknown"
+
+
+def resolve_identity(http_request: Request):
+    """(subject, tier, ip_subject) ফেরত দেয়। টোকেন ঠিক হলে ব্যবহারকারীর uuid, না হলে IP দিয়ে অতিথি।"""
+    ip_subject = "ip:" + _sha(client_ip(http_request))
+    auth = http_request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if token:
+        key = _sha(token, 40)
+        now = time.time()
+        hit = _TOKEN_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1], hit[2], ip_subject
+        # নেট/Supabase সমস্যা হলে exception উঠে যায়, ডাকা জায়গা fail-open করে
+        r = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            u = r.json()
+            uid = u.get("id")
+            if uid:
+                anon = u.get("is_anonymous")
+                if anon is None:
+                    anon = not bool(u.get("email"))
+                tier = "guest" if anon else "member"
+                if len(_TOKEN_CACHE) > 5000:
+                    _TOKEN_CACHE.clear()
+                _TOKEN_CACHE[key] = (now + 120, uid, tier)
+                return uid, tier, ip_subject
+    return ip_subject, "guest", ip_subject
+
+
+def usage_limit_for(kind: str, tier: str) -> int:
+    return GUEST_LIMITS[kind] * (MEMBER_MULT if tier == "member" else 1)
+
+
+def usage_consume(http_request: Request, kind: str, ref=None, ticket: str = ""):
+    """সীমা ঠিক থাকলে {'ok': True, ...state}, পেরোলে {'ok': False, 'info': {...}}। অবকাঠামো ব্যর্থ হলে exception।"""
+    subject, tier, ip_subject = resolve_identity(http_request)
+
+    # Text to edit-এর প্ল্যান ধাপের টিকিট থাকলে এডিট ধাপ আলাদা করে গোনা হয় না
+    if ticket:
+        if _sb_rpc("redeem_ticket", {"p_subject": subject, "p_ref": ticket}):
+            return {"ok": True, "subject": subject, "tier": tier, "consumed": False, "ip_subject": None, "ip_consumed": False}
+
+    limit = usage_limit_for(kind, tier)
+    res = _sb_rpc("consume_usage", {"p_subject": subject, "p_kind": kind, "p_limit": limit, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
+    if not res.get("ok"):
+        return {"ok": False, "info": {"kind": kind, "tier": tier, "used": res.get("used", limit), "limit": limit,
+                                      "reset_at": res.get("reset_at"), "hours": USAGE_HOURS}}
+    state = {"ok": True, "subject": subject, "tier": tier, "consumed": not res.get("duplicate"), "ip_subject": None, "ip_consumed": False}
+
+    # অতিথির জন্য IP-ভিত্তিক বাধা (নতুন বেনামি অ্যাকাউন্ট বানিয়ে সীমা এড়ানো কঠিন করে; মোবাইল নেটে IP ভাগ হয় বলে সীমা উদার)
+    if tier == "guest" and subject != ip_subject:
+        ip_limit = GUEST_LIMITS[kind] * IP_MULT
+        ipres = _sb_rpc("consume_usage", {"p_subject": ip_subject, "p_kind": kind, "p_limit": ip_limit, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
+        if not ipres.get("ok"):
+            if state["consumed"]:
+                _sb_rpc("refund_usage", {"p_subject": subject, "p_kind": kind, "p_ref": ref})
+            return {"ok": False, "info": {"kind": kind, "tier": tier, "used": GUEST_LIMITS[kind], "limit": GUEST_LIMITS[kind],
+                                          "reset_at": ipres.get("reset_at"), "hours": USAGE_HOURS, "network": True}}
+        state["ip_subject"] = ip_subject
+        state["ip_consumed"] = not ipres.get("duplicate")
+    return state
+
+
+def usage_refund(state, kind: str, ref=None):
+    """কাজ ব্যর্থ হলে গোনা ফেরত (কখনো exception ছুড়ে না)।"""
+    if not state:
+        return
+    try:
+        if state.get("consumed"):
+            _sb_rpc("refund_usage", {"p_subject": state["subject"], "p_kind": kind, "p_ref": ref})
+        if state.get("ip_consumed") and state.get("ip_subject"):
+            _sb_rpc("refund_usage", {"p_subject": state["ip_subject"], "p_kind": kind, "p_ref": ref})
+    except Exception as e:
+        print(f"[usage] refund ব্যর্থ: {e}")
+
+
+def limit_response(info: dict):
+    return JSONResponse(status_code=429, content={"error": "limit", "detail": "আপনার ফ্রি ব্যবহারের সীমা শেষ।", **info})
+
+
+def limited(kind: str, ref_from=None, ticket_param: str = ""):
+    """এন্ডপয়েন্টে সীমা বসানোর ডেকোরেটর। ফাংশনে `http_request: Request` প্যারামিটার থাকতে হবে।"""
+
+    def deco(fn):
+        def _ref(kwargs):
+            try:
+                return ref_from(kwargs) if ref_from else None
+            except Exception:
+                return None
+
+        def _ticket(kwargs):
+            return (kwargs.get(ticket_param) or "") if ticket_param else ""
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def wrapper(*args, **kwargs):
+                http_request = kwargs.get("http_request")
+                state, ref = None, _ref(kwargs)
+                if USAGE_ENABLED and http_request is not None:
+                    try:
+                        out = await run_in_threadpool(usage_consume, http_request, kind, ref, _ticket(kwargs))
+                    except Exception as e:
+                        print(f"[usage] সীমা যাচাই ব্যর্থ, কাজ চলতে দেওয়া হলো: {e}")
+                        out = None
+                    if out and not out["ok"]:
+                        return limit_response(out["info"])
+                    state = out
+                try:
+                    return await fn(*args, **kwargs)
+                except BaseException:
+                    if state:
+                        await run_in_threadpool(usage_refund, state, kind, ref)
+                    raise
+
+        else:
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                http_request = kwargs.get("http_request")
+                state, ref = None, _ref(kwargs)
+                if USAGE_ENABLED and http_request is not None:
+                    try:
+                        out = usage_consume(http_request, kind, ref, _ticket(kwargs))
+                    except Exception as e:
+                        print(f"[usage] সীমা যাচাই ব্যর্থ, কাজ চলতে দেওয়া হলো: {e}")
+                        out = None
+                    if out and not out["ok"]:
+                        return limit_response(out["info"])
+                    state = out
+                try:
+                    return fn(*args, **kwargs)
+                except BaseException:
+                    if state:
+                        usage_refund(state, kind, ref)
+                    raise
+
+        return wrapper
+
+    return deco
+
+
+@app.get("/api/usage")
+def usage_status(http_request: Request):
+    """ফ্রন্টএন্ডে 'আজ কতটা ব্যবহার হয়েছে' দেখানোর জন্য।"""
+    if not USAGE_ENABLED:
+        return {"enabled": False}
+    try:
+        subject, tier, _ = resolve_identity(http_request)
+        peek = _sb_rpc("peek_usage", {"p_subject": subject, "p_hours": USAGE_HOURS}) or {}
+        limits = {k: usage_limit_for(k, tier) for k in GUEST_LIMITS}
+        return {"enabled": True, "tier": tier, "hours": USAGE_HOURS, "limits": limits,
+                "usage": {k: (peek.get(k) or {}).get("used", 0) for k in GUEST_LIMITS}}
+    except Exception as e:
+        print(f"[usage] status ব্যর্থ: {e}")
+        return {"enabled": False}
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_root():
     """Render-এর স্বাস্থ্য-পরীক্ষা (HEAD /) আর ঘুম ভাঙানোর জন্য ছোট উত্তর।"""
@@ -139,7 +353,8 @@ def health_root():
 
 
 @app.post("/api/extract")
-def extract_video_info(request: VideoRequest):
+@limited("download", ref_from=lambda kw: _sha(kw["request"].url.strip()))
+def extract_video_info(request: VideoRequest, http_request: Request):
     video_url = request.url
 
     if not video_url:
@@ -365,7 +580,9 @@ def run_or_raise(cmd, timeout, fail_msg):
 
 
 @app.get("/api/convert")
+@limited("convert", ref_from=lambda kw: _sha("|".join(str(kw.get(k)) for k in ("url", "fmt", "quality", "bitrate"))))
 def convert_media(
+    http_request: Request,
     url: str,
     fmt: str = "mp4",
     quality: str = "1080p",
@@ -478,7 +695,9 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)
 
 
 @app.post("/api/convert-upload")
+@limited("convert")
 async def convert_uploaded_file(
+    http_request: Request,
     file: UploadFile = File(...),
     fmt: str = Form("mp4"),
     quality: str = Form("1080p"),
@@ -605,7 +824,9 @@ def build_crop_filter(preset: str) -> str:
 
 
 @app.get("/api/edit")
+@limited("edit_manual", ref_from=lambda kw: _sha("|".join(str(kw.get(k)) for k in ("url", "mode", "start", "end", "crop", "position", "level"))))
 def edit_media(
+    http_request: Request,
     url: str,
     mode: str,
     start: float = 0,
@@ -939,7 +1160,10 @@ def get_video_duration(ffmpeg_path: str, path: str) -> float:
 
 
 @app.post("/api/edit-upload")
+@limited("edit_manual", ticket_param="ai_ticket")
 async def edit_uploaded_file(
+    http_request: Request,
+    ai_ticket: str = Form(""),
     file: UploadFile = File(...),
     start: float = Form(0),
     end: float = Form(0),
@@ -1584,8 +1808,7 @@ def call_groq_plan(key: str, model: str, user_msg: str):
     return resp
 
 
-@app.post("/api/ai-edit-plan")
-def ai_edit_plan(body: AIPlanRequest, request: Request):
+def _ai_plan_core(body: AIPlanRequest, request: Request):
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="কী এডিট করতে চান তা লিখুন।")
@@ -1646,6 +1869,37 @@ def ai_edit_plan(body: AIPlanRequest, request: Request):
         "summary": summary.strip()[:300],
         "unsupported": unsupported.strip()[:300],
     }
+
+
+@app.post("/api/ai-edit-plan")
+def ai_edit_plan(body: AIPlanRequest, request: Request):
+    """AI ধাপ = ১টা edit_ai গোনা। সফল হলে এডিট ধাপের জন্য এক-ব্যবহারের টিকিট দেয় (এডিট ধাপ আলাদা করে গোনা হয় না)।"""
+    state = None
+    if USAGE_ENABLED:
+        try:
+            out = usage_consume(request, "edit_ai", None)
+        except Exception as e:
+            print(f"[usage] সীমা যাচাই ব্যর্থ, কাজ চলতে দেওয়া হলো: {e}")
+            out = None
+        if out and not out["ok"]:
+            return limit_response(out["info"])
+        state = out
+    try:
+        result = _ai_plan_core(body, request)
+    except BaseException:
+        usage_refund(state, "edit_ai", None)
+        raise
+    if state and state.get("consumed") is not None:
+        if not result.get("changed"):
+            usage_refund(state, "edit_ai", None)   # কোনো এডিট বোঝা না গেলে সীমা কাটে না
+        else:
+            nonce = secrets.token_urlsafe(16)
+            try:
+                _sb_rpc("issue_ticket", {"p_subject": state["subject"], "p_ref": nonce})
+                result["ticket"] = nonce
+            except Exception as e:
+                print(f"[usage] টিকিট বানানো ব্যর্থ: {e}")
+    return result
 
 
 # থাম্বনেইল আর জরুরি ফলব্যাকের জন্য পুরোনো স্ট্রিমিং এন্ডপয়েন্ট আগের মতোই আছে
