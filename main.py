@@ -138,7 +138,7 @@ def is_valid_http_url(u: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ব্যবহারের সীমা (প্রথম ব্যবহার থেকে rolling ২৪ ঘণ্টা) — Supabase-এর usage_events টেবিল (usage_setup.sql) দিয়ে
+# ক্রেডিট-ব্যবস্থা (rolling ২৪ ঘণ্টা) — Supabase-এর usage_events টেবিল (usage_setup.sql + credits_setup.sql) দিয়ে
 # Render-এ লাগবে: SUPABASE_URL আর SUPABASE_SERVICE_ROLE_KEY (গোপন চাবি! শুধু Render-এ, কখনো GitHub/ছবিতে নয়)
 # দুটোর একটা না থাকলে সীমা বন্ধ থাকে (লোকাল টেস্টে সুবিধা)। জরুরিতে বন্ধ করতে USAGE_LIMITS=off।
 # অতিথি = বেনামি (anonymous) Supabase অ্যাকাউন্ট; সদস্য = Google ইত্যাদি দিয়ে সাইন-আপ করা অ্যাকাউন্ট (সীমা ×৩)।
@@ -154,10 +154,23 @@ def _env_int(name, default):
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_SERVICE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 USAGE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY) and os.environ.get("USAGE_LIMITS", "on").lower() != "off"
-GUEST_LIMITS = {"download": 4, "convert": 1, "edit_manual": 1, "edit_ai": 1}
-MEMBER_MULT = _env_int("USAGE_MEMBER_MULT", 3)   # সাইন-আপ করলে সীমা এত গুণ
-IP_MULT = _env_int("USAGE_IP_MULT", 5)           # নতুন বেনামি অ্যাকাউন্ট বানিয়ে সীমা এড়ানো ঠেকাতে IP-ভিত্তিক দ্বিতীয় বাধা
+# ক্রেডিট-মডেল: প্রতিটা কাজের একটা দাম; ২৪ ঘণ্টায় অতিথির বাজেট ৮, সদস্যের ×৩ = ২৪ (সব Render-এর Environment দিয়ে বদলানো যায়)
+CREDIT_COSTS = {
+    "download": _env_int("CREDIT_COST_DOWNLOAD", 1),
+    "convert": _env_int("CREDIT_COST_CONVERT", 3),
+    "edit_manual": _env_int("CREDIT_COST_EDIT", 3),
+    "edit_ai": _env_int("CREDIT_COST_AI", 4),
+}
+GUEST_BUDGET = _env_int("CREDIT_GUEST_BUDGET", 8)
+MEMBER_MULT = _env_int("USAGE_MEMBER_MULT", 3)   # সাইন-আপ করলে বাজেট এত গুণ
+IP_MULT = _env_int("USAGE_IP_MULT", 5)           # নতুন বেনামি অ্যাকাউন্ট বানিয়ে ঘোরা ঠেকাতে IP-ভিত্তিক দ্বিতীয় বাজেট
 USAGE_HOURS = 24
+# বিজ্ঞাপন দেখে ক্রেডিট (শুধু সদস্য)। ADS_ENABLED=on না দিলে বন্ধ থাকে, তাই আসল বিজ্ঞাপন যুক্ত না হওয়া পর্যন্ত কেউ বিনামূল্যে ক্রেডিট পায় না।
+ADS_ENABLED = (os.environ.get("ADS_ENABLED", "off").lower() == "on")
+AD_CREDITS = _env_int("AD_CREDITS", 3)
+AD_MIN_SECONDS = _env_int("AD_MIN_SECONDS", 10)          # এর আগে শেষ-সংকেত গ্রহণ হয় না
+AD_COOLDOWN_SECONDS = _env_int("AD_COOLDOWN_SECONDS", 30)
+AD_HOURLY_MAX = _env_int("AD_HOURLY_MAX", 10)
 _TOKEN_CACHE = {}                                # sha256(token) -> (মেয়াদ, user_id, tier)
 
 print("[usage] সীমা চালু আছে" if USAGE_ENABLED else "[usage] সীমা বন্ধ (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY সেট নেই)")
@@ -222,35 +235,38 @@ def resolve_identity(http_request: Request):
     return ip_subject, "guest", ip_subject
 
 
-def usage_limit_for(kind: str, tier: str) -> int:
-    return GUEST_LIMITS[kind] * (MEMBER_MULT if tier == "member" else 1)
+def budget_for(tier: str) -> int:
+    return GUEST_BUDGET * (MEMBER_MULT if tier == "member" else 1)
 
 
 def usage_consume(http_request: Request, kind: str, ref=None, ticket: str = ""):
-    """সীমা ঠিক থাকলে {'ok': True, ...state}, পেরোলে {'ok': False, 'info': {...}}। অবকাঠামো ব্যর্থ হলে exception।"""
+    """ক্রেডিট থাকলে কেটে {'ok': True, ...state}; না থাকলে {'ok': False, 'info': {...}}। অবকাঠামো ব্যর্থ হলে exception।"""
     subject, tier, ip_subject = resolve_identity(http_request)
 
-    # Text to edit-এর প্ল্যান ধাপের টিকিট থাকলে এডিট ধাপ আলাদা করে গোনা হয় না
+    # Text to edit-এর প্ল্যান ধাপে (AI) আগেই ক্রেডিট কাটা হয়েছে; টিকিট থাকলে এডিট ধাপ আবার কাটে না
     if ticket:
         if _sb_rpc("redeem_ticket", {"p_subject": subject, "p_ref": ticket}):
             return {"ok": True, "subject": subject, "tier": tier, "consumed": False, "ip_subject": None, "ip_consumed": False}
 
-    limit = usage_limit_for(kind, tier)
-    res = _sb_rpc("consume_usage", {"p_subject": subject, "p_kind": kind, "p_limit": limit, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
+    cost = CREDIT_COSTS[kind]
+    budget = budget_for(tier)
+    res = _sb_rpc("consume_credits", {"p_subject": subject, "p_kind": kind, "p_cost": cost, "p_budget": budget,
+                                      "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
     if not res.get("ok"):
-        return {"ok": False, "info": {"kind": kind, "tier": tier, "used": res.get("used", limit), "limit": limit,
-                                      "reset_at": res.get("reset_at"), "hours": USAGE_HOURS}}
-    state = {"ok": True, "subject": subject, "tier": tier, "consumed": not res.get("duplicate"), "ip_subject": None, "ip_consumed": False}
+        return {"ok": False, "info": {"kind": kind, "tier": tier, "cost": cost, "balance": max(0, res.get("balance", 0)),
+                                      "budget": res.get("budget", budget), "reset_at": res.get("reset_at"), "hours": USAGE_HOURS}}
+    state = {"ok": True, "subject": subject, "tier": tier, "consumed": not res.get("duplicate"), "balance": res.get("balance"),
+             "ip_subject": None, "ip_consumed": False}
 
-    # অতিথির জন্য IP-ভিত্তিক বাধা (নতুন বেনামি অ্যাকাউন্ট বানিয়ে সীমা এড়ানো কঠিন করে; মোবাইল নেটে IP ভাগ হয় বলে সীমা উদার)
+    # অতিথির জন্য IP-ভিত্তিক বাজেট (মোবাইল নেটে IP ভাগ হয় বলে উদার)
     if tier == "guest" and subject != ip_subject:
-        ip_limit = GUEST_LIMITS[kind] * IP_MULT
-        ipres = _sb_rpc("consume_usage", {"p_subject": ip_subject, "p_kind": kind, "p_limit": ip_limit, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
+        ipres = _sb_rpc("consume_credits", {"p_subject": ip_subject, "p_kind": kind, "p_cost": cost,
+                                            "p_budget": GUEST_BUDGET * IP_MULT, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
         if not ipres.get("ok"):
             if state["consumed"]:
                 _sb_rpc("refund_usage", {"p_subject": subject, "p_kind": kind, "p_ref": ref})
-            return {"ok": False, "info": {"kind": kind, "tier": tier, "used": GUEST_LIMITS[kind], "limit": GUEST_LIMITS[kind],
-                                          "reset_at": ipres.get("reset_at"), "hours": USAGE_HOURS, "network": True}}
+            return {"ok": False, "info": {"kind": kind, "tier": tier, "cost": cost, "balance": max(0, (res.get("balance") or 0) + (cost if state["consumed"] else 0)),
+                                          "budget": budget, "reset_at": ipres.get("reset_at"), "hours": USAGE_HOURS, "network": True}}
         state["ip_subject"] = ip_subject
         state["ip_consumed"] = not ipres.get("duplicate")
     return state
@@ -270,7 +286,7 @@ def usage_refund(state, kind: str, ref=None):
 
 
 def limit_response(info: dict):
-    return JSONResponse(status_code=429, content={"error": "limit", "detail": "আপনার ফ্রি ব্যবহারের সীমা শেষ।", **info})
+    return JSONResponse(status_code=429, content={"error": "limit", "detail": "আপনার ক্রেডিট শেষ।", **info})
 
 
 def limited(kind: str, ref_from=None, ticket_param: str = ""):
@@ -337,21 +353,77 @@ def limited(kind: str, ref_from=None, ticket_param: str = ""):
 
 @app.get("/api/usage")
 def usage_status(http_request: Request):
-    """ফ্রন্টএন্ডে 'আজ কতটা ব্যবহার হয়েছে' দেখানোর জন্য।"""
+    """ফ্রন্টএন্ডে ব্যালেন্স দেখানোর জন্য (কিছু কাটে না)।"""
     if not USAGE_ENABLED:
         missing = [n for n, v in (("SUPABASE_URL", SUPABASE_URL), ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_KEY)) if not v]
         reason = "USAGE_LIMITS=off" if not missing else "missing_env"
         return {"enabled": False, "reason": reason, "missing": missing}
     try:
         subject, tier, _ = resolve_identity(http_request)
-        peek = _sb_rpc("peek_usage", {"p_subject": subject, "p_hours": USAGE_HOURS}) or {}
-        limits = {k: usage_limit_for(k, tier) for k in GUEST_LIMITS}
-        return {"enabled": True, "tier": tier, "hours": USAGE_HOURS, "limits": limits,
-                "usage": {k: (peek.get(k) or {}).get("used", 0) for k in GUEST_LIMITS}}
+        budget = budget_for(tier)
+        peek = _sb_rpc("peek_credits", {"p_subject": subject, "p_budget": budget, "p_hours": USAGE_HOURS}) or {}
+        return {"enabled": True, "tier": tier, "hours": USAGE_HOURS, "costs": CREDIT_COSTS,
+                "budget": peek.get("budget", budget), "balance": max(0, peek.get("balance", budget)),
+                "spent": peek.get("spent", 0), "bonus": peek.get("bonus", 0), "reset_at": peek.get("reset_at"),
+                "ads": bool(ADS_ENABLED and tier == "member"), "ad_credits": AD_CREDITS}
     except Exception as e:
         print(f"[usage] status ব্যর্থ: {e}")
         m = re.search(r"HTTP (\d{3})", str(e))
         return {"enabled": False, "reason": "supabase_error", "http_status": int(m.group(1)) if m else None}
+
+
+class AdCompleteRequest(BaseModel):
+    nonce: str
+
+
+@app.post("/api/ads/start")
+def ads_start(http_request: Request):
+    """বিজ্ঞাপন দেখানোর আগে একটা এক-ব্যবহারের নম্বর দেয় (শুধু সদস্য)।"""
+    if not (USAGE_ENABLED and ADS_ENABLED):
+        raise HTTPException(status_code=503, detail="বিজ্ঞাপন দেখে ক্রেডিট নেওয়ার ব্যবস্থা এখনো চালু হয়নি।")
+    try:
+        subject, tier, _ = resolve_identity(http_request)
+        if tier != "member":
+            raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+        nonce = secrets.token_urlsafe(16)
+        _sb_rpc("start_ad", {"p_subject": subject, "p_ref": nonce})
+        return {"nonce": nonce, "min_seconds": AD_MIN_SECONDS, "credits": AD_CREDITS}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ads] start ব্যর্থ: {e}")
+        raise HTTPException(status_code=502, detail="এখন বিজ্ঞাপন শুরু করা যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+
+
+@app.post("/api/ads/complete")
+def ads_complete(body: AdCompleteRequest, http_request: Request):
+    """বিজ্ঞাপন শেষ হলে ডাকা হয়; সার্ভার সময়, কুলডাউন ও ঘণ্টার সীমা দেখে ক্রেডিট যোগ করে।"""
+    if not (USAGE_ENABLED and ADS_ENABLED):
+        raise HTTPException(status_code=503, detail="বিজ্ঞাপন দেখে ক্রেডিট নেওয়ার ব্যবস্থা এখনো চালু হয়নি।")
+    try:
+        subject, tier, _ = resolve_identity(http_request)
+        if tier != "member":
+            raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+        res = _sb_rpc("redeem_ad", {"p_subject": subject, "p_ref": (body.nonce or "")[:64], "p_credits": AD_CREDITS,
+                                    "p_min_seconds": AD_MIN_SECONDS, "p_cooldown_seconds": AD_COOLDOWN_SECONDS,
+                                    "p_hourly_max": AD_HOURLY_MAX, "p_budget": budget_for(tier), "p_hours": USAGE_HOURS}) or {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ads] complete ব্যর্থ: {e}")
+        raise HTTPException(status_code=502, detail="এখন ক্রেডিট যোগ করা যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+    if res.get("ok"):
+        return {"ok": True, "credits": res.get("credits", AD_CREDITS), "balance": max(0, res.get("balance", 0))}
+    reason = res.get("reason")
+    messages = {
+        "invalid_ticket": "বিজ্ঞাপন যাচাই করা যায়নি। আবার চেষ্টা করুন।",
+        "too_soon": "বিজ্ঞাপন পুরোটা দেখা শেষ হয়নি।",
+        "cooldown": "একটু অপেক্ষা করে আবার চেষ্টা করুন।",
+        "hourly_limit": "এক ঘণ্টায় বিজ্ঞাপনের সীমা শেষ। কিছুক্ষণ পরে আবার চেষ্টা করুন।",
+    }
+    code = 429 if reason in ("cooldown", "hourly_limit") else 400
+    return JSONResponse(status_code=code, content={"ok": False, "reason": reason, "detail": messages.get(reason, "ক্রেডিট যোগ করা যায়নি।"),
+                                                   "retry_after": res.get("retry_after")})
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
