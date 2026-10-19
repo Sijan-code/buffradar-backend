@@ -168,9 +168,13 @@ USAGE_HOURS = 24
 # বিজ্ঞাপন দেখে ক্রেডিট (শুধু সদস্য)। ADS_ENABLED=on না দিলে বন্ধ থাকে, তাই আসল বিজ্ঞাপন যুক্ত না হওয়া পর্যন্ত কেউ বিনামূল্যে ক্রেডিট পায় না।
 ADS_ENABLED = (os.environ.get("ADS_ENABLED", "off").lower() == "on")
 AD_CREDITS = _env_int("AD_CREDITS", 3)
-AD_MIN_SECONDS = _env_int("AD_MIN_SECONDS", 10)          # এর আগে শেষ-সংকেত গ্রহণ হয় না
+AD_MIN_SECONDS = _env_int("AD_MIN_SECONDS", 15)          # এর আগে শেষ-সংকেত গ্রহণ হয় না
 AD_COOLDOWN_SECONDS = _env_int("AD_COOLDOWN_SECONDS", 30)
 AD_HOURLY_MAX = _env_int("AD_HOURLY_MAX", 10)
+# রেফারেল: আমন্ত্রিত সদস্য অন্তত ১টা সফল কাজ করলে দু'জনেই বোনাস (মেয়াদ কয়েক দিন); আমন্ত্রণকারী ৩০ দিনে সর্বোচ্চ REFERRAL_MONTHLY_CAP জনের জন্য পুরস্কার পান
+REFERRAL_CREDITS = _env_int("REFERRAL_CREDITS", 5)
+REFERRAL_DAYS = _env_int("REFERRAL_DAYS", 7)
+REFERRAL_MONTHLY_CAP = _env_int("REFERRAL_MONTHLY_CAP", 10)
 _TOKEN_CACHE = {}                                # sha256(token) -> (মেয়াদ, user_id, tier)
 
 print("[usage] সীমা চালু আছে" if USAGE_ENABLED else "[usage] সীমা বন্ধ (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY সেট নেই)")
@@ -365,7 +369,8 @@ def usage_status(http_request: Request):
         return {"enabled": True, "tier": tier, "hours": USAGE_HOURS, "costs": CREDIT_COSTS,
                 "budget": peek.get("budget", budget), "balance": max(0, peek.get("balance", budget)),
                 "spent": peek.get("spent", 0), "bonus": peek.get("bonus", 0), "reset_at": peek.get("reset_at"),
-                "ads": bool(ADS_ENABLED and tier == "member"), "ad_credits": AD_CREDITS}
+                "grants": peek.get("grants", 0), "ads": bool(ADS_ENABLED and tier == "member"), "ad_credits": AD_CREDITS,
+                "ad_seconds": AD_MIN_SECONDS, "referral_credits": REFERRAL_CREDITS, "referral_days": REFERRAL_DAYS}
     except Exception as e:
         print(f"[usage] status ব্যর্থ: {e}")
         m = re.search(r"HTTP (\d{3})", str(e))
@@ -424,6 +429,49 @@ def ads_complete(body: AdCompleteRequest, http_request: Request):
     code = 429 if reason in ("cooldown", "hourly_limit") else 400
     return JSONResponse(status_code=code, content={"ok": False, "reason": reason, "detail": messages.get(reason, "ক্রেডিট যোগ করা যায়নি।"),
                                                    "retry_after": res.get("retry_after")})
+
+
+class ReferralClaimRequest(BaseModel):
+    code: str
+
+
+def _member_only(http_request: Request) -> str:
+    if not USAGE_ENABLED:
+        raise HTTPException(status_code=503, detail="এই সুবিধা এখনো চালু হয়নি।")
+    subject, tier, _ = resolve_identity(http_request)
+    if tier != "member":
+        raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+    return subject
+
+
+@app.get("/api/referral/me")
+def referral_me(http_request: Request):
+    """নিজের রেফারেল-কোড ও পরিসংখ্যান (শুধু সদস্য)।"""
+    subject = _member_only(http_request)
+    try:
+        code = _sb_rpc("get_referral_code", {"p_user": subject})
+        stats = _sb_rpc("referral_stats", {"p_user": subject}) or {}
+    except Exception as e:
+        print(f"[referral] me ব্যর্থ: {e}")
+        raise HTTPException(status_code=502, detail="এখন রেফারেল-লিংক বানানো যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+    return {"code": code, "credits": REFERRAL_CREDITS, "days": REFERRAL_DAYS, "cap": REFERRAL_MONTHLY_CAP,
+            "invited": stats.get("invited", 0), "rewarded": stats.get("rewarded", 0), "rewarded_30d": stats.get("rewarded_30d", 0)}
+
+
+@app.post("/api/referral/claim")
+def referral_claim(body: ReferralClaimRequest, http_request: Request):
+    """আমন্ত্রিত ব্যক্তি সাইন-আপের পর ডাকে; শর্ত পূরণ হলে দু'জনেই বোনাস পায়, নইলে 'pending' (পরে আবার ডাকবে)।"""
+    subject = _member_only(http_request)
+    code = re.sub(r"[^A-Za-z0-9]", "", body.code or "")[:12].upper()
+    if not code:
+        return {"status": "invalid"}
+    try:
+        res = _sb_rpc("claim_referral", {"p_invitee": subject, "p_code": code, "p_credits": REFERRAL_CREDITS,
+                                         "p_days": REFERRAL_DAYS, "p_cap": REFERRAL_MONTHLY_CAP}) or {}
+    except Exception as e:
+        print(f"[referral] claim ব্যর্থ: {e}")
+        raise HTTPException(status_code=502, detail="এখন রেফারেল যাচাই করা যাচ্ছে না।")
+    return {"status": res.get("status", "invalid"), "credits": res.get("credits", 0)}
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
