@@ -160,7 +160,10 @@ CREDIT_COSTS = {
     "convert": _env_int("CREDIT_COST_CONVERT", 3),
     "edit_manual": _env_int("CREDIT_COST_EDIT", 3),
     "edit_ai": _env_int("CREDIT_COST_AI", 4),
+    "meme_ai": _env_int("CREDIT_COST_MEME_AI", 1),   # Meme Maker caption ideas
 }
+# নতুন ধরনের কাজ ডেটাবেসে পুরোনো ধরনের নামে গোনা হয় (SQL-এ ধরনের তালিকা আছে, তাই SQL বদলাতে হয় না); দাম আলাদা
+DB_KINDS = {"meme_ai": "edit_ai"}
 GUEST_BUDGET = _env_int("CREDIT_GUEST_BUDGET", 8)
 MEMBER_MULT = _env_int("USAGE_MEMBER_MULT", 3)   # সাইন-আপ করলে বাজেট এত গুণ
 IP_MULT = _env_int("USAGE_IP_MULT", 5)           # নতুন বেনামি অ্যাকাউন্ট বানিয়ে ঘোরা ঠেকাতে IP-ভিত্তিক দ্বিতীয় বাজেট
@@ -254,7 +257,7 @@ def usage_consume(http_request: Request, kind: str, ref=None, ticket: str = ""):
 
     cost = CREDIT_COSTS[kind]
     budget = budget_for(tier)
-    res = _sb_rpc("consume_credits", {"p_subject": subject, "p_kind": kind, "p_cost": cost, "p_budget": budget,
+    res = _sb_rpc("consume_credits", {"p_subject": subject, "p_kind": DB_KINDS.get(kind, kind), "p_cost": cost, "p_budget": budget,
                                       "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
     if not res.get("ok"):
         return {"ok": False, "info": {"kind": kind, "tier": tier, "cost": cost, "balance": max(0, res.get("balance", 0)),
@@ -264,11 +267,11 @@ def usage_consume(http_request: Request, kind: str, ref=None, ticket: str = ""):
 
     # অতিথির জন্য IP-ভিত্তিক বাজেট (মোবাইল নেটে IP ভাগ হয় বলে উদার)
     if tier == "guest" and subject != ip_subject:
-        ipres = _sb_rpc("consume_credits", {"p_subject": ip_subject, "p_kind": kind, "p_cost": cost,
+        ipres = _sb_rpc("consume_credits", {"p_subject": ip_subject, "p_kind": DB_KINDS.get(kind, kind), "p_cost": cost,
                                             "p_budget": GUEST_BUDGET * IP_MULT, "p_ref": ref, "p_hours": USAGE_HOURS}) or {}
         if not ipres.get("ok"):
             if state["consumed"]:
-                _sb_rpc("refund_usage", {"p_subject": subject, "p_kind": kind, "p_ref": ref})
+                _sb_rpc("refund_usage", {"p_subject": subject, "p_kind": DB_KINDS.get(kind, kind), "p_ref": ref})
             return {"ok": False, "info": {"kind": kind, "tier": tier, "cost": cost, "balance": max(0, (res.get("balance") or 0) + (cost if state["consumed"] else 0)),
                                           "budget": budget, "reset_at": ipres.get("reset_at"), "hours": USAGE_HOURS, "network": True}}
         state["ip_subject"] = ip_subject
@@ -282,15 +285,15 @@ def usage_refund(state, kind: str, ref=None):
         return
     try:
         if state.get("consumed"):
-            _sb_rpc("refund_usage", {"p_subject": state["subject"], "p_kind": kind, "p_ref": ref})
+            _sb_rpc("refund_usage", {"p_subject": state["subject"], "p_kind": DB_KINDS.get(kind, kind), "p_ref": ref})
         if state.get("ip_consumed") and state.get("ip_subject"):
-            _sb_rpc("refund_usage", {"p_subject": state["ip_subject"], "p_kind": kind, "p_ref": ref})
+            _sb_rpc("refund_usage", {"p_subject": state["ip_subject"], "p_kind": DB_KINDS.get(kind, kind), "p_ref": ref})
     except Exception as e:
         print(f"[usage] refund ব্যর্থ: {e}")
 
 
 def limit_response(info: dict):
-    return JSONResponse(status_code=429, content={"error": "limit", "detail": "আপনার ক্রেডিট শেষ।", **info})
+    return JSONResponse(status_code=429, content={"error": "limit", "detail": "You have run out of credits.", **info})
 
 
 def limited(kind: str, ref_from=None, ticket_param: str = ""):
@@ -385,11 +388,11 @@ class AdCompleteRequest(BaseModel):
 def ads_start(http_request: Request):
     """বিজ্ঞাপন দেখানোর আগে একটা এক-ব্যবহারের নম্বর দেয় (শুধু সদস্য)।"""
     if not (USAGE_ENABLED and ADS_ENABLED):
-        raise HTTPException(status_code=503, detail="বিজ্ঞাপন দেখে ক্রেডিট নেওয়ার ব্যবস্থা এখনো চালু হয়নি।")
+        raise HTTPException(status_code=503, detail="Earning credits by watching an ad isn’t available yet.")
     try:
         subject, tier, _ = resolve_identity(http_request)
         if tier != "member":
-            raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+            raise HTTPException(status_code=403, detail="Please sign in with Google first.")
         nonce = secrets.token_urlsafe(16)
         _sb_rpc("start_ad", {"p_subject": subject, "p_ref": nonce})
         return {"nonce": nonce, "min_seconds": AD_MIN_SECONDS, "credits": AD_CREDITS}
@@ -397,18 +400,18 @@ def ads_start(http_request: Request):
         raise
     except Exception as e:
         print(f"[ads] start ব্যর্থ: {e}")
-        raise HTTPException(status_code=502, detail="এখন বিজ্ঞাপন শুরু করা যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="We can’t start an ad right now. Please try again shortly.")
 
 
 @app.post("/api/ads/complete")
 def ads_complete(body: AdCompleteRequest, http_request: Request):
     """বিজ্ঞাপন শেষ হলে ডাকা হয়; সার্ভার সময়, কুলডাউন ও ঘণ্টার সীমা দেখে ক্রেডিট যোগ করে।"""
     if not (USAGE_ENABLED and ADS_ENABLED):
-        raise HTTPException(status_code=503, detail="বিজ্ঞাপন দেখে ক্রেডিট নেওয়ার ব্যবস্থা এখনো চালু হয়নি।")
+        raise HTTPException(status_code=503, detail="Earning credits by watching an ad isn’t available yet.")
     try:
         subject, tier, _ = resolve_identity(http_request)
         if tier != "member":
-            raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+            raise HTTPException(status_code=403, detail="Please sign in with Google first.")
         res = _sb_rpc("redeem_ad", {"p_subject": subject, "p_ref": (body.nonce or "")[:64], "p_credits": AD_CREDITS,
                                     "p_min_seconds": AD_MIN_SECONDS, "p_cooldown_seconds": AD_COOLDOWN_SECONDS,
                                     "p_hourly_max": AD_HOURLY_MAX, "p_budget": budget_for(tier), "p_hours": USAGE_HOURS}) or {}
@@ -416,18 +419,18 @@ def ads_complete(body: AdCompleteRequest, http_request: Request):
         raise
     except Exception as e:
         print(f"[ads] complete ব্যর্থ: {e}")
-        raise HTTPException(status_code=502, detail="এখন ক্রেডিট যোগ করা যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="We can’t add credits right now. Please try again shortly.")
     if res.get("ok"):
         return {"ok": True, "credits": res.get("credits", AD_CREDITS), "balance": max(0, res.get("balance", 0))}
     reason = res.get("reason")
     messages = {
-        "invalid_ticket": "বিজ্ঞাপন যাচাই করা যায়নি। আবার চেষ্টা করুন।",
-        "too_soon": "বিজ্ঞাপন পুরোটা দেখা শেষ হয়নি।",
-        "cooldown": "একটু অপেক্ষা করে আবার চেষ্টা করুন।",
-        "hourly_limit": "এক ঘণ্টায় বিজ্ঞাপনের সীমা শেষ। কিছুক্ষণ পরে আবার চেষ্টা করুন।",
+        "invalid_ticket": "We couldn’t verify the ad. Please try again.",
+        "too_soon": "The ad hasn’t finished playing yet.",
+        "cooldown": "Please wait a moment and try again.",
+        "hourly_limit": "You’ve reached the hourly ad limit. Please try again later.",
     }
     code = 429 if reason in ("cooldown", "hourly_limit") else 400
-    return JSONResponse(status_code=code, content={"ok": False, "reason": reason, "detail": messages.get(reason, "ক্রেডিট যোগ করা যায়নি।"),
+    return JSONResponse(status_code=code, content={"ok": False, "reason": reason, "detail": messages.get(reason, "Credits couldn’t be added."),
                                                    "retry_after": res.get("retry_after")})
 
 
@@ -437,10 +440,10 @@ class ReferralClaimRequest(BaseModel):
 
 def _member_only(http_request: Request) -> str:
     if not USAGE_ENABLED:
-        raise HTTPException(status_code=503, detail="এই সুবিধা এখনো চালু হয়নি।")
+        raise HTTPException(status_code=503, detail="This feature isn’t available yet.")
     subject, tier, _ = resolve_identity(http_request)
     if tier != "member":
-        raise HTTPException(status_code=403, detail="আগে Google দিয়ে সাইন-আপ করুন।")
+        raise HTTPException(status_code=403, detail="Please sign in with Google first.")
     return subject
 
 
@@ -453,7 +456,7 @@ def referral_me(http_request: Request):
         stats = _sb_rpc("referral_stats", {"p_user": subject}) or {}
     except Exception as e:
         print(f"[referral] me ব্যর্থ: {e}")
-        raise HTTPException(status_code=502, detail="এখন রেফারেল-লিংক বানানো যাচ্ছে না। একটু পরে চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="We can’t create your invite link right now. Please try again shortly.")
     return {"code": code, "credits": REFERRAL_CREDITS, "days": REFERRAL_DAYS, "cap": REFERRAL_MONTHLY_CAP,
             "invited": stats.get("invited", 0), "rewarded": stats.get("rewarded", 0), "rewarded_30d": stats.get("rewarded_30d", 0)}
 
@@ -470,7 +473,7 @@ def referral_claim(body: ReferralClaimRequest, http_request: Request):
                                          "p_days": REFERRAL_DAYS, "p_cap": REFERRAL_MONTHLY_CAP}) or {}
     except Exception as e:
         print(f"[referral] claim ব্যর্থ: {e}")
-        raise HTTPException(status_code=502, detail="এখন রেফারেল যাচাই করা যাচ্ছে না।")
+        raise HTTPException(status_code=502, detail="We can’t verify the referral right now.")
     return {"status": res.get("status", "invalid"), "credits": res.get("credits", 0)}
 
 
@@ -486,7 +489,7 @@ def extract_video_info(request: VideoRequest, http_request: Request):
     video_url = request.url
 
     if not video_url:
-        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+        raise HTTPException(status_code=400, detail="Please enter a valid link.")
 
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
@@ -514,7 +517,7 @@ def extract_video_info(request: VideoRequest, http_request: Request):
                 direct_url = info['formats'][-1].get('url')
 
         if not direct_url:
-            raise HTTPException(status_code=404, detail="ভিডিওর সরাসরি সোর্স লিঙ্ক পাওয়া যায়নি।")
+            raise HTTPException(status_code=404, detail="Couldn’t find a direct source link for this video.")
 
         # ---- audio-only স্ট্রিম বের করা (Audio tab-এর জন্য আলাদা লিংক) ----
         audio_url = None
@@ -551,7 +554,7 @@ def extract_video_info(request: VideoRequest, http_request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"লিঙ্কটি প্রসেস করা যায়নি: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Couldn’t process this link: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +569,7 @@ def download_file(
     bitrate: str = "192kbps",
 ):
     if not is_valid_http_url(url):
-        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+        raise HTTPException(status_code=400, detail="Please enter a valid link.")
 
     tmpdir = tempfile.mkdtemp(prefix="buffradar_")
     try:
@@ -612,7 +615,7 @@ def download_file(
             if not f.endswith((".part", ".ytdl"))
         ]
         if result.returncode != 0 or not files:
-            detail = (result.stderr or "").strip()[-300:] or "ফাইল তৈরি করা যায়নি।"
+            detail = (result.stderr or "").strip()[-300:] or "Couldn’t create the file."
             raise RuntimeError(detail)
 
         filepath = max(files, key=os.path.getsize)
@@ -629,7 +632,7 @@ def download_file(
 
     except subprocess.TimeoutExpired:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise HTTPException(status_code=504, detail="ফাইল তৈরি করতে বেশি সময় লাগছে।")
+        raise HTTPException(status_code=504, detail="Creating the file is taking too long.")
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -718,13 +721,13 @@ def convert_media(
 ):
     fmt = (fmt or "").lower().strip()
     if not is_valid_http_url(url):
-        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+        raise HTTPException(status_code=400, detail="Please enter a valid link.")
     if fmt not in CONVERT_FORMATS:
-        raise HTTPException(status_code=400, detail="এই ফরম্যাটটি সাপোর্টেড নয়।")
+        raise HTTPException(status_code=400, detail="This format isn’t supported.")
 
     # সার্ভার ব্যস্ত থাকলে লাইনে না রেখে সাথে সাথে জানিয়ে দেওয়া (নাহলে সার্ভার ক্র্যাশ করতে পারে)
     if not CONVERT_SLOTS.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি কনভার্শন করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="The server is busy with another conversion. Please try again in a minute or two.")
 
     tmpdir = None
     handed_off = False
@@ -733,12 +736,12 @@ def convert_media(
         with yt_dlp.YoutubeDL(with_cookies({"quiet": True, "no_warnings": True, "noplaylist": True})) as ydl:
             info = ydl.extract_info(url, download=False)
         if info.get("is_live"):
-            raise HTTPException(status_code=400, detail="লাইভ ভিডিও কনভার্ট করা যাবে না।")
+            raise HTTPException(status_code=400, detail="Live videos can’t be converted.")
         duration = info.get("duration") or 0
         if duration and duration > MAX_CONVERT_SECONDS:
             raise HTTPException(
                 status_code=400,
-                detail=f"কনভার্টারে সর্বোচ্চ {MAX_CONVERT_SECONDS // 60} মিনিটের ভিডিও করা যায়। এই ভিডিওটি {int(duration) // 60} মিনিটের।",
+                detail=f"The converter supports videos up to {MAX_CONVERT_SECONDS // 60} minutes. This video is about {int(duration) // 60} minutes long.",
             )
 
         tmpdir = tempfile.mkdtemp(prefix="buffradar_conv_")
@@ -766,14 +769,14 @@ def convert_media(
                 "--", url,
             ],
             timeout=1200,
-            fail_msg="সোর্স ফাইল নামানো যায়নি।",
+            fail_msg="Couldn’t download the source file.",
         )
         sources = [
             f for f in glob.glob(os.path.join(tmpdir, "src.*"))
             if not f.endswith((".part", ".ytdl"))
         ]
         if not sources:
-            raise RuntimeError("সোর্স ফাইল নামানো যায়নি।")
+            raise RuntimeError("Couldn’t download the source file.")
         src_path = max(sources, key=os.path.getsize)
 
         # ---- ধাপ ২: ffmpeg দিয়ে কনভার্ট ----
@@ -783,10 +786,10 @@ def convert_media(
             + build_ffmpeg_args(fmt, bitrate)
             + [out_path],
             timeout=1800,
-            fail_msg="কনভার্ট করা যায়নি।",
+            fail_msg="Conversion failed.",
         )
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError("কনভার্ট করা ফাইল তৈরি হয়নি।")
+            raise RuntimeError("The converted file wasn’t created.")
 
         try:
             os.remove(src_path)  # জায়গা বাঁচাতে সোর্স ফাইল আগেই মুছে ফেলা
@@ -804,7 +807,7 @@ def convert_media(
     except HTTPException:
         raise
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="কনভার্ট করতে বেশি সময় লাগছে। ছোট ভিডিও বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+        raise HTTPException(status_code=504, detail="Conversion is taking too long. Try a shorter video or lower quality.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -833,11 +836,11 @@ async def convert_uploaded_file(
 ):
     fmt = (fmt or "").lower().strip()
     if fmt not in CONVERT_FORMATS:
-        raise HTTPException(status_code=400, detail="এই ফরম্যাটটি সাপোর্টেড নয়।")
+        raise HTTPException(status_code=400, detail="This format isn’t supported.")
 
     # সার্ভার ব্যস্ত থাকলে লাইনে না রেখে সাথে সাথে জানিয়ে দেওয়া
     if not CONVERT_SLOTS.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি কনভার্শন করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="The server is busy with another conversion. Please try again in a minute or two.")
 
     tmpdir = None
     handed_off = False
@@ -857,11 +860,11 @@ async def convert_uploaded_file(
                 if written > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"ফাইলটি অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)}MB পর্যন্ত সাপোর্টেড।",
+                        detail=f"This file is too large. The maximum is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
                     )
                 out.write(chunk)
         if written == 0:
-            raise HTTPException(status_code=400, detail="খালি ফাইল আপলোড করা যাবে না।")
+            raise HTTPException(status_code=400, detail="Empty files can’t be uploaded.")
 
         # ---- ধাপ ২: ffmpeg দিয়ে কনভার্ট ----
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
@@ -871,10 +874,10 @@ async def convert_uploaded_file(
             + build_ffmpeg_args(fmt, bitrate)
             + [out_path],
             timeout=1800,
-            fail_msg="কনভার্ট করা যায়নি।",
+            fail_msg="Conversion failed.",
         )
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError("কনভার্ট করা ফাইল তৈরি হয়নি।")
+            raise RuntimeError("The converted file wasn’t created.")
 
         try:
             os.remove(src_path)  # জায়গা বাঁচাতে সোর্স ফাইল আগেই মুছে ফেলা
@@ -892,7 +895,7 @@ async def convert_uploaded_file(
     except HTTPException:
         raise
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="কনভার্ট করতে বেশি সময় লাগছে। ছোট ফাইল বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+        raise HTTPException(status_code=504, detail="Conversion is taking too long. Try a smaller file or lower quality.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -965,16 +968,16 @@ def edit_media(
 ):
     mode = (mode or "").lower().strip()
     if not is_valid_http_url(url):
-        raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+        raise HTTPException(status_code=400, detail="Please enter a valid link.")
     if mode not in ("trim", "remove", "compress"):
-        raise HTTPException(status_code=400, detail="এই এডিট টুলটি সাপোর্টেড নয়।")
+        raise HTTPException(status_code=400, detail="This edit tool isn’t supported.")
     if mode == "remove" and position not in REMOVE_POSITION_PRESETS:
-        raise HTTPException(status_code=400, detail="ভুল পজিশন দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid position.")
     if mode == "compress" and level not in COMPRESS_LEVELS:
-        raise HTTPException(status_code=400, detail="ভুল কমপ্রেশন লেভেল দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid compression level.")
 
     if not EDIT_SLOTS.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি এডিট প্রসেস করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="The server is busy with another edit. Please try again in a minute or two.")
 
     tmpdir = None
     handed_off = False
@@ -982,12 +985,12 @@ def edit_media(
         with yt_dlp.YoutubeDL(with_cookies({"quiet": True, "no_warnings": True, "noplaylist": True})) as ydl:
             info = ydl.extract_info(url, download=False)
         if info.get("is_live"):
-            raise HTTPException(status_code=400, detail="লাইভ ভিডিও এডিট করা যাবে না।")
+            raise HTTPException(status_code=400, detail="Live videos can’t be edited.")
         duration = info.get("duration") or 0
         if duration and duration > MAX_EDIT_SECONDS:
             raise HTTPException(
                 status_code=400,
-                detail=f"এডিটরে সর্বোচ্চ {MAX_EDIT_SECONDS // 60} মিনিটের ভিডিও করা যায়। এই ভিডিওটি {int(duration) // 60} মিনিটের।",
+                detail=f"The editor supports videos up to {MAX_EDIT_SECONDS // 60} minutes. This video is about {int(duration) // 60} minutes long.",
             )
 
         tmpdir = tempfile.mkdtemp(prefix="buffradar_edit_")
@@ -1006,14 +1009,14 @@ def edit_media(
                 "--", url,
             ],
             timeout=1200,
-            fail_msg="সোর্স ফাইল নামানো যায়নি।",
+            fail_msg="Couldn’t download the source file.",
         )
         sources = [
             f for f in glob.glob(os.path.join(tmpdir, "src.*"))
             if not f.endswith((".part", ".ytdl"))
         ]
         if not sources:
-            raise RuntimeError("সোর্স ফাইল নামানো যায়নি।")
+            raise RuntimeError("Couldn’t download the source file.")
         src_path = max(sources, key=os.path.getsize)
 
         # ---- ধাপ ২: মোড অনুযায়ী ffmpeg কমান্ড বানানো ----
@@ -1025,7 +1028,7 @@ def edit_media(
             e = float(end or 0)
             dur = e - s
             if dur <= 0:
-                raise HTTPException(status_code=400, detail="End time অবশ্যই Start time-এর চেয়ে বেশি হতে হবে।")
+                raise HTTPException(status_code=400, detail="End time must be greater than start time.")
             pre_args = ["-ss", str(s), "-t", str(dur)]
             crop_vf = build_crop_filter(crop)
             if crop_vf:
@@ -1054,10 +1057,10 @@ def edit_media(
             + ["-c:v", "libx264", "-preset", "veryfast", "-crf", crf, "-pix_fmt", "yuv420p"]
             + ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out_path]
         )
-        run_or_raise(cmd, timeout=1800, fail_msg="এডিট করা যায়নি।")
+        run_or_raise(cmd, timeout=1800, fail_msg="Edit failed.")
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError("এডিট করা ফাইল তৈরি হয়নি।")
+            raise RuntimeError("The edited file wasn’t created.")
 
         try:
             os.remove(src_path)
@@ -1075,7 +1078,7 @@ def edit_media(
     except HTTPException:
         raise
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="এডিট করতে বেশি সময় লাগছে। ছোট অংশ বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+        raise HTTPException(status_code=504, detail="Editing is taking too long. Try a shorter section or lower quality.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1220,15 +1223,15 @@ def parse_cuts(raw: str, lo: float, hi: float):
     try:
         data = json.loads(raw or "[]")
     except Exception:
-        raise HTTPException(status_code=400, detail="কাটার তথ্য ঠিক নেই।")
+        raise HTTPException(status_code=400, detail="Invalid cut data.")
     if not isinstance(data, list) or len(data) > MAX_CUTS:
-        raise HTTPException(status_code=400, detail=f"কাটার তথ্য ঠিক নেই (সর্বোচ্চ {MAX_CUTS}টি)।")
+        raise HTTPException(status_code=400, detail=f"Invalid cut data (maximum {MAX_CUTS} cuts).")
     rngs = []
     for item in data:
         try:
             x, y = float(item[0]), float(item[1])
         except Exception:
-            raise HTTPException(status_code=400, detail="কাটার তথ্য ঠিক নেই।")
+            raise HTTPException(status_code=400, detail="Invalid cut data.")
         x, y = max(lo, x), min(hi, y)
         if y - x >= 0.05:
             rngs.append((x, y))
@@ -1262,10 +1265,10 @@ async def save_upload_limited(up, path: str, limit: int, label: str):
                 break
             written += len(chunk)
             if written > limit:
-                raise HTTPException(status_code=413, detail=f"{label} ফাইলটি অনেক বড় (সর্বোচ্চ {limit // (1024 * 1024)}MB)।")
+                raise HTTPException(status_code=413, detail=f"The {label} file is too large (maximum {limit // (1024 * 1024)} MB).")
             out.write(chunk)
     if written == 0:
-        raise HTTPException(status_code=400, detail=f"খালি {label} ফাইল।")
+        raise HTTPException(status_code=400, detail=f"The {label} file is empty.")
 
 
 def has_audio_stream(ffmpeg_path: str, path: str) -> bool:
@@ -1329,26 +1332,26 @@ async def edit_uploaded_file(
 ):
     # ---- ইনপুট যাচাই ----
     if rotate not in (0, 90, 180, 270):
-        raise HTTPException(status_code=400, detail="ভুল রোটেশন দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid rotation.")
     if aspect not in ("original", "9:16", "1:1", "16:9"):
-        raise HTTPException(status_code=400, detail="ভুল aspect ratio দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid aspect ratio.")
     if resolution not in EDIT_RESOLUTIONS:
-        raise HTTPException(status_code=400, detail="ভুল রেজোলিউশন দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid resolution.")
     if not (0.5 <= speed <= 2):
-        raise HTTPException(status_code=400, detail="স্পিড ০.৫x থেকে ২x-এর মধ্যে হতে হবে।")
+        raise HTTPException(status_code=400, detail="Speed must be between 0.5x and 2x.")
     if not (0 <= volume <= 200):
-        raise HTTPException(status_code=400, detail="ভলিউম ০ থেকে ২০০%-এর মধ্যে হতে হবে।")
+        raise HTTPException(status_code=400, detail="Volume must be between 0% and 200%.")
     if text_position not in ("top", "center", "bottom"):
-        raise HTTPException(status_code=400, detail="ভুল টেক্সট পজিশন দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid text position.")
     muted = (mute or "").lower() == "true"
     start = max(0.0, float(start or 0))
     end = float(end or 0)
     if end > 0 and end <= start:
-        raise HTTPException(status_code=400, detail="End time অবশ্যই Start time-এর চেয়ে বেশি হতে হবে।")
+        raise HTTPException(status_code=400, detail="End time must be greater than start time.")
     text = (text or "").strip()[:200]
     text_size = min(max(int(text_size or 36), 8), 200)
     if filter_preset not in EDIT_FILTER_PRESETS:
-        raise HTTPException(status_code=400, detail="ভুল ফিল্টার দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid filter.")
     brightness = min(max(int(brightness or 0), -100), 100)
     contrast = min(max(int(contrast or 0), -100), 100)
     saturation = min(max(int(saturation or 0), -100), 100)
@@ -1359,10 +1362,10 @@ async def edit_uploaded_file(
     try:
         meta = json.loads(sticker_meta or "[]")
     except Exception:
-        raise HTTPException(status_code=400, detail="স্টিকারের তথ্য ঠিক নেই।")
+        raise HTTPException(status_code=400, detail="Invalid sticker data.")
     stickers = [u for u in (stickers or []) if getattr(u, "filename", None)]
     if not isinstance(meta, list) or len(meta) != len(stickers) or len(stickers) > MAX_STICKERS:
-        raise HTTPException(status_code=400, detail=f"স্টিকার সর্বোচ্চ {MAX_STICKERS}টি দেওয়া যায়।")
+        raise HTTPException(status_code=400, detail=f"You can add up to {MAX_STICKERS} stickers.")
     clean_meta = []
     for m in meta:
         try:
@@ -1374,11 +1377,11 @@ async def edit_uploaded_file(
                 "to": max(0.0, float(m.get("to") or 0)),
             })
         except Exception:
-            raise HTTPException(status_code=400, detail="স্টিকারের তথ্য ঠিক নেই।")
+            raise HTTPException(status_code=400, detail="Invalid sticker data.")
 
 
     if flip not in EDIT_FLIPS or effect not in EDIT_EFFECTS or fit not in EDIT_FITS or output_format not in EDIT_FORMATS:
-        raise HTTPException(status_code=400, detail="ভুল অপশন দেওয়া হয়েছে।")
+        raise HTTPException(status_code=400, detail="Invalid option.")
     effect_amount = min(max(int(effect_amount or 0), 0), 100)
     reverse_on = (reverse or "").lower() == "true"
     text_box = (text_bg or "").lower() == "true"
@@ -1386,7 +1389,7 @@ async def edit_uploaded_file(
     text_to = max(0.0, float(text_to or 0))
 
     if not EDIT_SLOTS.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="সার্ভার এখন অন্য একটি এডিট প্রসেস করছে। ১-২ মিনিট পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="The server is busy with another edit. Please try again in a minute or two.")
 
     tmpdir = None
     handed_off = False
@@ -1406,18 +1409,18 @@ async def edit_uploaded_file(
                 if written > MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"ফাইলটি অনেক বড়। সর্বোচ্চ {MAX_UPLOAD_BYTES // (1024 * 1024)}MB পর্যন্ত সাপোর্টেড।",
+                        detail=f"This file is too large. The maximum is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
                     )
                 out.write(chunk)
         if written == 0:
-            raise HTTPException(status_code=400, detail="খালি ফাইল আপলোড করা যাবে না।")
+            raise HTTPException(status_code=400, detail="Empty files can’t be uploaded.")
 
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
         duration = get_video_duration(ffmpeg_path, src_path)
         if duration and duration > MAX_EDIT_SECONDS:
             raise HTTPException(
                 status_code=400,
-                detail=f"এডিটরে সর্বোচ্চ {MAX_EDIT_SECONDS // 60} মিনিটের ভিডিও করা যায়। এই ভিডিওটি {int(duration) // 60} মিনিটের।",
+                detail=f"The editor supports videos up to {MAX_EDIT_SECONDS // 60} minutes. This video is about {int(duration) // 60} minutes long.",
             )
 
         main_has_audio = has_audio_stream(ffmpeg_path, src_path)
@@ -1426,13 +1429,13 @@ async def edit_uploaded_file(
         music_path = None
         if music is not None and getattr(music, "filename", None):
             music_path = os.path.join(tmpdir, "music" + (os.path.splitext(music.filename)[1] or ".mp3"))
-            await save_upload_limited(music, music_path, MAX_MUSIC_BYTES, "অডিও")
+            await save_upload_limited(music, music_path, MAX_MUSIC_BYTES, "audio")
             if not has_audio_stream(ffmpeg_path, music_path):
-                raise HTTPException(status_code=400, detail="অডিও ফাইলটি পড়া যায়নি। MP3, WAV বা M4A দিন।")
+                raise HTTPException(status_code=400, detail="Couldn’t read the audio file. Please use MP3, WAV or M4A.")
         sticker_items = []
         for k, up in enumerate(stickers):
             sp = os.path.join(tmpdir, f"sticker{k}" + (os.path.splitext(up.filename)[1] or ".png"))
-            await save_upload_limited(up, sp, MAX_STICKER_BYTES, "স্টিকার")
+            await save_upload_limited(up, sp, MAX_STICKER_BYTES, "sticker")
             sticker_items.append((sp, clean_meta[k]))
 
         # ---- ধাপ ২: কোন কোন অংশ রাখা হবে (Trim + Cut) ----
@@ -1441,7 +1444,7 @@ async def edit_uploaded_file(
         if hi > 0:
             kept = kept_from_cuts(start, hi, cut_ranges)
             if not kept:
-                raise HTTPException(status_code=400, detail="পুরো ভিডিও কেটে ফেলা যায় না।")
+                raise HTTPException(status_code=400, detail="You can’t cut out the whole video.")
         else:
             kept = [(start, None)]
         clip_dur = sum(y - x for x, y in kept) if hi > 0 else 0.0
@@ -1470,7 +1473,7 @@ async def edit_uploaded_file(
             return f":enable='between(t,{s0:.3f},{e0:.3f})'"
 
         if reverse_on and clip_dur > MAX_REVERSE_SECONDS:
-            raise HTTPException(status_code=400, detail=f"Reverse শুধু {MAX_REVERSE_SECONDS} সেকেন্ডের ছোট ক্লিপে করা যায়।")
+            raise HTTPException(status_code=400, detail=f"Reverse works only on clips up to {MAX_REVERSE_SECONDS} seconds.")
 
         fi, fo = fade_in, fade_out
         if clip_dur <= 0:
@@ -1481,7 +1484,7 @@ async def edit_uploaded_file(
         out_dur = clip_dur / speed if clip_dur > 0 else 0.0
 
         if output_format == "gif" and out_dur > MAX_GIF_SECONDS:
-            raise HTTPException(status_code=400, detail=f"GIF সর্বোচ্চ {MAX_GIF_SECONDS} সেকেন্ডের হতে পারে। Trim বা Cut করে ছোট করুন।")
+            raise HTTPException(status_code=400, detail=f"GIFs can be at most {MAX_GIF_SECONDS} seconds long. Trim or cut the video to make it shorter.")
 
         want_v = output_format != "mp3"
         ext = {"mp4": "mp4", "gif": "gif", "mp3": "mp3"}[output_format]
@@ -1594,7 +1597,7 @@ async def edit_uploaded_file(
                 try:
                     render_text_png(text, png_path, find_edit_font(), text_size, tcolor, int(fw * 0.9), box=text_box)
                 except ImportError:
-                    raise HTTPException(status_code=500, detail="টেক্সট যোগ করতে সার্ভারে Pillow ইনস্টল করা দরকার (pip install Pillow)।")
+                    raise HTTPException(status_code=500, detail="Adding text requires Pillow on the server (pip install Pillow).")
                 y_expr = {"top": "H*0.05", "center": "(H-h)/2", "bottom": "H-h-H*0.05"}[text_position]
                 inputs += ["-i", png_path]
                 idx = n_in
@@ -1666,7 +1669,7 @@ async def edit_uploaded_file(
                 graph.append(f"{final_a}{','.join(fl) if fl else 'anull'}[aout]")
                 audio_map = ["-map", "[aout]"]
         if output_format == "mp3" and not audio_map:
-            raise HTTPException(status_code=400, detail="MP3 বানাতে অডিও দরকার, কিন্তু এই ভিডিওতে (বা মিউট করা থাকায়) কোনো অডিও নেই।")
+            raise HTTPException(status_code=400, detail="An MP3 needs audio, but this video has none (or it’s muted).")
 
         if output_format == "mp4":
             codec_args = ["-c:v", "libx264", "-preset", EDIT_X264_PRESET, "-crf", "22", "-pix_fmt", "yuv420p"] + EDIT_THREAD_ARGS
@@ -1690,10 +1693,10 @@ async def edit_uploaded_file(
             + codec_args
             + [out_path]
         )
-        run_or_raise(cmd, timeout=1800, fail_msg="এডিট করা যায়নি।")
+        run_or_raise(cmd, timeout=1800, fail_msg="Edit failed.")
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError("এডিট করা ফাইল তৈরি হয়নি।")
+            raise RuntimeError("The edited file wasn’t created.")
 
         try:
             os.remove(src_path)
@@ -1711,7 +1714,7 @@ async def edit_uploaded_file(
     except HTTPException:
         raise
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="এডিট করতে বেশি সময় লাগছে। ছোট অংশ বা কম কোয়ালিটি দিয়ে চেষ্টা করুন।")
+        raise HTTPException(status_code=504, detail="Editing is taking too long. Try a shorter section or lower quality.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1939,13 +1942,13 @@ def call_groq_plan(key: str, model: str, user_msg: str):
 def _ai_plan_core(body: AIPlanRequest, request: Request):
     prompt = (body.prompt or "").strip()
     if not prompt:
-        raise HTTPException(status_code=400, detail="কী এডিট করতে চান তা লিখুন।")
+        raise HTTPException(status_code=400, detail="Please describe the edit you want.")
     if len(prompt) > 500:
-        raise HTTPException(status_code=400, detail="লেখাটি অনেক বড়। ৫০০ অক্ষরের মধ্যে লিখুন।")
+        raise HTTPException(status_code=400, detail="Your text is too long. Please keep it within 500 characters.")
 
     key = os.environ.get("GROQ_API_KEY")
     if not key:
-        raise HTTPException(status_code=503, detail="AI এখনো চালু করা হয়নি (সার্ভারে GROQ_API_KEY সেট করা নেই)।")
+        raise HTTPException(status_code=503, detail="AI editing isn’t set up yet (GROQ_API_KEY is missing on the server).")
 
     # একই IP থেকে অতিরিক্ত অনুরোধ আটকানো (API খরচ বাঁচাতে)
     fwd = request.headers.get("x-forwarded-for", "")
@@ -1953,7 +1956,7 @@ def _ai_plan_core(body: AIPlanRequest, request: Request):
     now = time.time()
     hits = [t for t in AI_RATE.get(ip, []) if now - t < AI_RATE_WINDOW]
     if len(hits) >= AI_RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="অনেকগুলো অনুরোধ হয়ে গেছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="Too many requests. Please try again in a little while.")
     hits.append(now)
     AI_RATE[ip] = hits
 
@@ -1967,26 +1970,26 @@ def _ai_plan_core(body: AIPlanRequest, request: Request):
     try:
         resp = call_groq_plan(key, model, user_msg)
     except requests.RequestException:
-        raise HTTPException(status_code=502, detail="AI সার্ভারের সাথে যোগাযোগ করা যায়নি। আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="Couldn’t reach the AI service. Please try again.")
 
     if resp.status_code != 200:
         # সমস্যা খুঁজতে সুবিধা হয়: Groq কী বলেছে সার্ভারের টার্মিনালে দেখা যাবে (key কখনো প্রিন্ট হয় না)
         print(f"[ai-edit-plan] Groq HTTP {resp.status_code} (model={model}): {resp.text[:400]}")
     if resp.status_code == 429:
-        raise HTTPException(status_code=429, detail="AI এখন ব্যস্ত। কিছুক্ষণ পরে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=429, detail="The AI is busy right now. Please try again in a little while.")
     if resp.status_code in (401, 403):
-        raise HTTPException(status_code=502, detail="AI-এর key ঠিক নেই। সার্ভারের GROQ_API_KEY যাচাই করুন।")
+        raise HTTPException(status_code=502, detail="The AI key is invalid. Please check GROQ_API_KEY on the server.")
     if resp.status_code == 404:
-        raise HTTPException(status_code=502, detail="AI-এর মডেল পাওয়া যায়নি। সার্ভারের টার্মিনালে বিস্তারিত দেখুন।")
+        raise HTTPException(status_code=502, detail="The AI model wasn’t found. See the server logs for details.")
     if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="AI উত্তর দিতে পারেনি। আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="The AI couldn’t respond. Please try again.")
     try:
         content = resp.json()["choices"][0]["message"]["content"]
         raw = parse_ai_json(content)
         if not isinstance(raw, dict):
             raise ValueError("not an object")
     except Exception:
-        raise HTTPException(status_code=502, detail="AI-এর উত্তর বোঝা যায়নি। অন্যভাবে লিখে আবার চেষ্টা করুন।")
+        raise HTTPException(status_code=502, detail="We couldn’t understand the AI’s reply. Try rephrasing your request.")
 
     plan = sanitize_ai_plan(raw, duration)
     summary = raw.get("summary") if isinstance(raw.get("summary"), str) else ""
@@ -2030,6 +2033,101 @@ def ai_edit_plan(body: AIPlanRequest, request: Request):
     return result
 
 
+# ---------------------------------------------------------------------------
+# Meme Maker: AI ক্যাপশনের আইডিয়া (/api/meme-captions) — শুধু লেখা যায়, ছবি নয়। প্রতিবার ১ ক্রেডিট (CREDIT_COST_MEME_AI)।
+# ব্যর্থ হলে (AI উত্তর না দিলে, বা কিছুই না বানাতে পারলে) ক্রেডিট ফেরত যায়।
+# ---------------------------------------------------------------------------
+MEME_SYSTEM_PROMPT = """You write short, funny caption ideas for an image-macro meme maker. Reply with a single JSON object and nothing else:
+{"captions": [{"top": "...", "bottom": "..."}, ...]}
+Rules:
+- Give exactly 5 captions. "top" and "bottom" are each at most 60 characters. "bottom" may be empty for a one-line meme.
+- Use familiar meme patterns (for example "POV: ...", "Me when ...", "Nobody: / Me: ...", dry understatement, relatable everyday situations) and keep the humor friendly.
+- Style "american": everyday American life and pop culture (school, office, road trips, food, sports, suburbs). Style "global": universal internet humor that works anywhere.
+- Never mention real, named people (celebrities, politicians, public figures). No hate, slurs, harassment, sexual content, or jokes about tragedies, religion, ethnicity or disability. No political campaigning.
+- If the request breaks these rules, reply {"captions": []}.
+- Write in English only."""
+
+
+class MemeCaptionRequest(BaseModel):
+    idea: str
+    style: str = "global"
+
+
+def sanitize_meme_captions(raw) -> list:
+    """AI-এর উত্তর বিশ্বাস না করে পরিষ্কার করা: সর্বোচ্চ ৫টি, ছোট লেখা, কন্ট্রোল-ক্যারেক্টার বাদ।"""
+    items = raw.get("captions") if isinstance(raw, dict) else None
+    out = []
+    if not isinstance(items, list):
+        return out
+    for it in items[:10]:
+        if not isinstance(it, dict):
+            continue
+        top = re.sub(r"[\x00-\x1f]+", " ", str(it.get("top") or "")).strip()[:80]
+        bottom = re.sub(r"[\x00-\x1f]+", " ", str(it.get("bottom") or "")).strip()[:80]
+        if top or bottom:
+            out.append({"top": top, "bottom": bottom})
+        if len(out) == 5:
+            break
+    return out
+
+
+def call_groq_chat(key: str, model: str, system_prompt: str, user_msg: str, max_tokens: int = 700):
+    base = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
+        "temperature": 0.9,
+    }
+    variants = [
+        {**base, "response_format": {"type": "json_object"}, "reasoning_effort": "low", "include_reasoning": False, "max_completion_tokens": max_tokens},
+        {**base, "response_format": {"type": "json_object"}, "max_completion_tokens": max_tokens},
+        {**base, "max_completion_tokens": max_tokens},
+    ]
+    resp = None
+    for body in variants:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=40,
+        )
+        if resp.status_code != 400:
+            break
+    return resp
+
+
+@app.post("/api/meme-captions")
+@limited("meme_ai")
+def meme_captions(body: MemeCaptionRequest, http_request: Request):
+    idea = re.sub(r"\s+", " ", body.idea or "").strip()
+    if not idea:
+        raise HTTPException(status_code=400, detail="Please describe your meme idea.")
+    if len(idea) > 200:
+        raise HTTPException(status_code=400, detail="Your idea is too long. Please keep it within 200 characters.")
+    style = "american" if (body.style or "").lower() == "american" else "global"
+
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Caption ideas aren’t available right now.")
+    model = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-20b"
+    try:
+        resp = call_groq_chat(key, model, MEME_SYSTEM_PROMPT, f"Style: {style}\nMeme idea: {idea}")
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Couldn’t reach the AI service. Please try again.")
+    if resp.status_code == 429:
+        raise HTTPException(status_code=429, detail="The AI is busy right now. Please try again in a little while.")
+    if resp.status_code != 200:
+        print(f"[meme-captions] Groq HTTP {resp.status_code} (model={model}): {resp.text[:300]}")
+        raise HTTPException(status_code=502, detail="The AI couldn’t respond. Please try again.")
+    try:
+        raw = parse_ai_json(resp.json()["choices"][0]["message"]["content"])
+    except Exception:
+        raise HTTPException(status_code=502, detail="We couldn’t understand the AI’s reply. Please try again.")
+    captions = sanitize_meme_captions(raw)
+    if not captions:
+        raise HTTPException(status_code=422, detail="We couldn’t come up with captions for that. Try describing the situation differently.")
+    return {"captions": captions}
+
+
 # থাম্বনেইল আর জরুরি ফলব্যাকের জন্য পুরোনো স্ট্রিমিং এন্ডপয়েন্ট আগের মতোই আছে
 # (শুধু লিংক যাচাই আর '--' যোগ হয়েছে)
 @app.get("/api/proxy-download")
@@ -2042,7 +2140,7 @@ async def proxy_download(
     try:
         decoded_url = urllib.parse.unquote(url)
         if not is_valid_http_url(decoded_url):
-            raise HTTPException(status_code=400, detail="অনুগ্রহ করে একটি বৈধ লিঙ্ক দিন।")
+            raise HTTPException(status_code=400, detail="Please enter a valid link.")
         ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
         if is_audio:
